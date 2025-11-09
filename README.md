@@ -48,11 +48,9 @@ docker exec dispatcharr which ffmpeg
 | Groups to Check | string | - | Comma-separated group names, empty = all groups |
 | Connection Timeout | number | 10 | Seconds to wait for stream connection |
 | Dead Connection Retries | number | 3 | Number of retry attempts for failed streams |
-| Dead Channel Prefix | string | - | Prefix to add to dead channel names |
-| Dead Channel Suffix | string | - | Suffix to add to dead channel names |
+| Dead Channel Rename Format | string | "{name} [DEAD]" | Format for renaming dead channels. Use {name} as placeholder |
 | Move Dead Channels to Group | string | "Graveyard" | Group to move dead channels to |
-| Low Framerate Prefix | string | - | Prefix for channels under 30fps |
-| Low Framerate Suffix | string | " [Slow]" | Suffix for channels under 30fps |
+| Low Framerate Rename Format | string | "{name} [Slow]" | Format for renaming low FPS channels. Use {name} as placeholder |
 | Move Low Framerate Group | string | "Slow" | Group to move low framerate channels to |
 | Video Format Suffixes | string | "4k, FHD, HD, SD, Unknown" | Formats to add as suffixes |
 
@@ -136,11 +134,9 @@ docker exec dispatcharr which ffmpeg
 | Groups to Check | string | - | Comma-separated group names, empty = all groups |
 | Connection Timeout | number | 10 | Seconds to wait for stream connection |
 | Dead Connection Retries | number | 3 | Number of retry attempts for failed streams |
-| Dead Channel Prefix | string | - | Prefix to add to dead channel names |
-| Dead Channel Suffix | string | - | Suffix to add to dead channel names |
+| Dead Channel Rename Format | string | "{name} [DEAD]" | Format for renaming dead channels. Use {name} as placeholder |
 | Move Dead Channels to Group | string | "Graveyard" | Group to move dead channels to |
-| Low Framerate Prefix | string | - | Prefix for channels under 30fps |
-| Low Framerate Suffix | string | " [Slow]" | Suffix for channels under 30fps |
+| Low Framerate Rename Format | string | "{name} [Slow]" | Format for renaming low FPS channels. Use {name} as placeholder |
 | Move Low Framerate Group | string | "Slow" | Group to move low framerate channels to |
 | Video Format Suffixes | string | "4k, FHD, HD, SD, Unknown" | Formats to add as suffixes |
 
@@ -177,11 +173,11 @@ docker exec dispatcharr which ffmpeg
 ## Channel Management Features
 
 ### Dead Channel Management
-- **Rename Dead Channels:** Add configurable prefix/suffix to dead streams
+- **Rename Dead Channels:** Rename dead channels using customizable format string (e.g., "[DEAD] {name}")
 - **Move Dead Channels:** Automatically relocate dead channels to the specified group
 
 ### Low Framerate Management (<30fps)
-- **Rename Low FPS Channels:** Add configurable prefix/suffix to slow streams  
+- **Rename Low FPS Channels:** Rename low FPS channels using customizable format string (e.g., "{name} [Slow]")
 - **Move Low FPS Channels:** Automatically relocate slow channels to the specified group
 
 ### Video Format Management
@@ -189,7 +185,7 @@ docker exec dispatcharr which ffmpeg
 - **Remove Existing Tags:** Clean up channels by removing text within square brackets []
 
 ### Smart Features
-- **Duplicate Prevention:** Avoids adding prefixes/suffixes that already exist
+- **Flexible Renaming:** Use {name} placeholder in format strings for complete control over channel naming
 - **Auto Group Creation:** Creates target groups if they don't exist
 - **GUI Refresh:** Automatically updates Dispatcharr interface after changes
 
@@ -229,9 +225,9 @@ docker exec dispatcharr which ffmpeg
 - **View Last Results:** Summary of completed check
 
 ### Channel Management
-- **Rename Dead Channels:** Apply prefixes/suffixes to dead streams
+- **Rename Dead Channels:** Apply rename format to dead streams
 - **Move Dead Channels to Group:** Relocate dead channels
-- **Rename Low Framerate Channels:** Apply prefixes/suffixes to slow streams
+- **Rename Low Framerate Channels:** Apply rename format to slow streams
 - **Move Low Framerate Channels to Group:** Relocate slow channels
 - **Add Video Format Suffix to Channels:** Apply format tags
 - **Remove [] tags:** Clean up channel names
@@ -349,11 +345,11 @@ This plugin integrates deeply with Dispatcharr's API and channel management syst
 ## Channel Management Features
 
 ### Dead Channel Management
-- **Rename Dead Channels:** Add configurable prefix/suffix to dead streams
+- **Rename Dead Channels:** Rename dead channels using customizable format string (e.g., "[DEAD] {name}")
 - **Move Dead Channels:** Automatically relocate dead channels to the specified group
 
 ### Low Framerate Management (<30fps)
-- **Rename Low FPS Channels:** Add configurable prefix/suffix to slow streams  
+- **Rename Low FPS Channels:** Rename low FPS channels using customizable format string (e.g., "{name} [Slow]")
 - **Move Low FPS Channels:** Automatically relocate slow channels to the specified group
 
 ### Video Format Management
@@ -361,7 +357,7 @@ This plugin integrates deeply with Dispatcharr's API and channel management syst
 - **Remove Existing Tags:** Clean up channels by removing text within square brackets []
 
 ### Smart Features
-- **Duplicate Prevention:** Avoids adding prefixes/suffixes that already exist
+- **Flexible Renaming:** Use {name} placeholder in format strings for complete control over channel naming
 - **Auto Group Creation:** Creates target groups if they don't exist
 - **GUI Refresh:** Automatically updates Dispatcharr interface after changes
 
@@ -401,9 +397,9 @@ This plugin integrates deeply with Dispatcharr's API and channel management syst
 - **View Last Results:** Summary of completed check
 
 ### Channel Management
-- **Rename Dead Channels:** Apply prefixes/suffixes to dead streams
+- **Rename Dead Channels:** Apply rename format to dead streams
 - **Move Dead Channels to Group:** Relocate dead channels
-- **Rename Low Framerate Channels:** Apply prefixes/suffixes to slow streams
+- **Rename Low Framerate Channels:** Apply rename format to slow streams
 - **Move Low Framerate Channels to Group:** Relocate slow channels
 - **Add Video Format Suffix to Channels:** Apply format tags
 - **Remove [] tags:** Clean up channel names
