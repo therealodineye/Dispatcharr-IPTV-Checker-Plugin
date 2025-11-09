@@ -124,77 +124,65 @@ class Plugin:
             "id": "parallel_workers",
             "label": "👷 Number of Parallel Workers",
             "type": "number",
-            "default": 5,
-            "help_text": "Number of streams to check simultaneously when parallel checking is enabled. Default: 5. Higher values = faster but more resource-intensive.",
+            "default": 2,
+            "help_text": "Number of streams to check simultaneously when parallel checking is enabled. Default: 2. Higher values = faster but more resource-intensive.",
         }
     ]
     
     actions = [
         {
+            "id": "validate_settings",
+            "label": "✅ Validate Settings",
+            "description": "Validate all plugin settings (API connection, credentials, groups, etc.).",
+        },
+        {
             "id": "load_groups",
-            "label": "Load Group(s)",
+            "label": "📥 Load Group(s)",
             "description": "Load channels from the specified Dispatcharr group(s) (or all groups if blank).",
         },
         {
-            "id": "check_streams",
-            "label": "Process Channels/Streams", 
-            "description": "Check stream status (alive/dead), framerate, and identify video format (HD, SD etc.)",
-            "confirm": { "required": True, "title": "Check Streams?", "message": "This will check all streams from the previously loaded groups. Continue?" }
-        },
-        {
-            "id": "get_status_update",
-            "label": "Get Status Update",
-            "description": "Internal action for retrieving periodic status updates during stream checking.",
-        },
-        {
-            "id": "get_results",
-            "label": "View Last Results",
-            "description": "Display live progress if a check is running or summary of the last check.",
+            "id": "process_and_monitor",
+            "label": "🔍 Process & Monitor Streams",
+            "description": "Check stream status and quality, or view current progress and results.",
         },
         {
             "id": "rename_channels",
-            "label": "Rename Dead Channels",
+            "label": "✏️ Rename Dead Channels",
             "description": "Rename all channels marked as 'Dead' in the last check using the configured rename format.",
             "confirm": { "required": True, "title": "Rename Dead Channels?", "message": "This action is irreversible. Continue?" }
         },
         {
             "id": "move_dead_channels",
-            "label": "Move Dead Channels to Group",
+            "label": "⚰️ Move Dead Channels to Group",
             "description": "Moves all channels marked as 'Dead' in the last check to the specified group.",
             "confirm": { "required": True, "title": "Move Dead Channels?", "message": "This action is irreversible. Continue?" }
         },
         {
             "id": "rename_low_framerate_channels",
-            "label": "Rename Low Framerate Channels",
+            "label": "🐌 Rename Low Framerate Channels",
             "description": "Rename channels with streams under 30fps using the configured rename format.",
             "confirm": { "required": True, "title": "Rename Low Framerate Channels?", "message": "This action is irreversible. Continue?" }
         },
         {
             "id": "move_low_framerate_channels",
-            "label": "Move Low Framerate Channels to Group",
+            "label": "📁 Move Low Framerate Channels to Group",
             "description": "Moves channels with streams under 30fps to the specified group.",
             "confirm": { "required": True, "title": "Move Low Framerate Channels?", "message": "This action is irreversible. Continue?" }
         },
         {
             "id": "add_video_format_suffix",
-            "label": "Add Video Format Suffix to Channels",
+            "label": "🎬 Add Video Format Suffix to Channels",
             "description": "Adds a format suffix like [HD] or [FHD] to alive channel names.",
             "confirm": { "required": True, "title": "Add Video Format Suffixes?", "message": "This will rename channels based on the last check. This action is irreversible. Continue?" }
         },
         {
-            "id": "remove_bracket_tags",
-            "label": "Remove [] tags",
-            "description": "Removes any text inside square brackets [] from the names of all loaded channels.",
-            "confirm": { "required": True, "title": "Remove [] tags from Channel Names?", "message": "This will modify the names of all currently loaded channels. This action is irreversible. Continue?" }
-        },
-        {
             "id": "view_table",
-            "label": "View Results Table",
+            "label": "📊 View Results Table",
             "description": "Display detailed results in table format. (Copy/paste into text editor for better formatting."
         },
         {
             "id": "export_results",
-            "label": "Export Results to CSV",
+            "label": "💾 Export Results to CSV",
             "description": "Export the last check results to a CSV file. Will be saved in Docker container: /data/exports/"
         }
     ]
@@ -223,25 +211,23 @@ class Plugin:
             logger = context.get("logger", LOGGER)
             
             action_map = {
+                "validate_settings": self.validate_settings_action,
                 "load_groups": self.load_groups_action,
-                "check_streams": self.check_streams_action,
-                "get_results": self.get_results_action,
-                "get_status_update": self.get_status_update_action,
+                "process_and_monitor": self.process_and_monitor_action,
                 "rename_channels": self.rename_channels_action,
                 "move_dead_channels": self.move_dead_channels_action,
                 "rename_low_framerate_channels": self.rename_low_framerate_channels_action,
                 "move_low_framerate_channels": self.move_low_framerate_channels_action,
                 "add_video_format_suffix": self.add_video_format_suffix_action,
-                "remove_bracket_tags": self.remove_tags_action,
                 "view_table": self.view_table_action,
                 "export_results": self.export_results_action,
             }
-            
+
             if action not in action_map:
                 return {"status": "error", "message": f"Unknown action: {action}"}
-            
+
             # Pass context to actions that need it
-            if action in ["check_streams", "get_status_update"]:
+            if action in ["process_and_monitor"]:
                 return action_map[action](settings, logger, context)
             else:
                 return action_map[action](settings, logger)
@@ -310,19 +296,163 @@ class Plugin:
         """Background loop to generate status updates every minute"""
         while not self.stop_status_updates and self.check_progress['status'] == 'running':
             time.sleep(60)  # Wait 60 seconds
-            
+
             if self.check_progress['status'] == 'running' and not self.stop_status_updates:
                 current = self.check_progress['current']
                 total = self.check_progress['total']
                 percent = (current / total * 100) if total > 0 else 0
-                
+
                 # Store the status message for retrieval
                 self.pending_status_message = f"Checking streams {current}/{total} - {percent:.0f}% complete"
-                
+
                 # Log for debugging
                 logger = context.get("logger", LOGGER)
                 logger.info(f"STATUS UPDATE READY: {self.pending_status_message}")
-            
+
+    def validate_settings_action(self, settings, logger):
+        """Validate all plugin settings including API connection, credentials, and groups."""
+        validation_results = []
+        has_errors = False
+
+        # Validate Dispatcharr URL
+        dispatcharr_url = settings.get("dispatcharr_url", "").strip()
+        if not dispatcharr_url:
+            validation_results.append("❌ Dispatcharr URL is not configured")
+            has_errors = True
+        else:
+            validation_results.append(f"✅ Dispatcharr URL configured: {dispatcharr_url}")
+
+        # Validate credentials
+        username = settings.get("dispatcharr_username", "").strip()
+        password = settings.get("dispatcharr_password", "").strip()
+
+        if not username:
+            validation_results.append("❌ Admin Username is not configured")
+            has_errors = True
+        else:
+            validation_results.append(f"✅ Admin Username configured: {username}")
+
+        if not password:
+            validation_results.append("❌ Admin Password is not configured")
+            has_errors = True
+        else:
+            validation_results.append("✅ Admin Password is configured")
+
+        # Test API connection if credentials are provided
+        if dispatcharr_url and username and password:
+            try:
+                token, error = self._get_api_token(settings, logger)
+                if error:
+                    validation_results.append(f"❌ API Connection Failed: {error}")
+                    has_errors = True
+                else:
+                    validation_results.append("✅ API Connection successful")
+
+                    # Validate groups if specified
+                    group_names_str = settings.get("group_names", "").strip()
+                    if group_names_str:
+                        try:
+                            all_groups = self._get_api_data("/api/channels/groups/", token, settings)
+                            group_name_to_id = {g['name']: g['id'] for g in all_groups if 'name' in g and 'id' in g}
+                            input_names = {name.strip() for name in group_names_str.split(',') if name.strip()}
+                            valid_names = {n for n in input_names if n in group_name_to_id}
+                            invalid_names = input_names - valid_names
+
+                            if valid_names:
+                                validation_results.append(f"✅ Valid groups found: {', '.join(valid_names)}")
+                            if invalid_names:
+                                validation_results.append(f"⚠️ Invalid groups (not found): {', '.join(invalid_names)}")
+                                has_errors = True
+                        except Exception as e:
+                            validation_results.append(f"❌ Failed to validate groups: {str(e)}")
+                            has_errors = True
+                    else:
+                        validation_results.append("ℹ️ No specific groups configured (will check all groups)")
+            except Exception as e:
+                validation_results.append(f"❌ Validation error: {str(e)}")
+                has_errors = True
+
+        # Validate other settings
+        timeout = settings.get("timeout", 10)
+        if timeout <= 0:
+            validation_results.append(f"⚠️ Connection Timeout should be greater than 0 (current: {timeout})")
+            has_errors = True
+        else:
+            validation_results.append(f"✅ Connection Timeout: {timeout} seconds")
+
+        parallel_workers = settings.get("parallel_workers", 2)
+        if parallel_workers < 1:
+            validation_results.append(f"⚠️ Parallel Workers should be at least 1 (current: {parallel_workers})")
+            has_errors = True
+        else:
+            validation_results.append(f"✅ Parallel Workers: {parallel_workers}")
+
+        # Return results
+        status = "error" if has_errors else "success"
+        message = "\n".join(validation_results)
+
+        if has_errors:
+            message += "\n\n⚠️ Please fix the errors above before using the plugin."
+        else:
+            message += "\n\n✅ All settings are valid! You can now use the plugin."
+
+        return {"status": status, "message": message}
+
+    def process_and_monitor_action(self, settings, logger, context):
+        """Smart action that combines stream processing and monitoring."""
+        # Check if a check is currently running
+        if self.check_progress['status'] == 'running':
+            # Return current status
+            current, total = self.check_progress['current'], self.check_progress['total']
+            percent = (current / total * 100) if total > 0 else 0
+
+            # Calculate ETA
+            if self.check_progress.get('start_time') and current > 0:
+                elapsed_seconds = time.time() - self.check_progress['start_time']
+                avg_time_per_stream = elapsed_seconds / current
+                remaining_streams = total - current
+                eta_seconds = remaining_streams * avg_time_per_stream
+                eta_minutes = eta_seconds / 60
+
+                if eta_minutes < 1:
+                    eta_str = f"ETA: <1 min"
+                else:
+                    eta_str = f"ETA: {eta_minutes:.0f} min"
+            else:
+                eta_str = "ETA: calculating..."
+
+            message = f"🔄 Checking streams {current}/{total} - {percent:.0f}% complete | {eta_str}"
+            return {"status": "success", "message": message}
+
+        # Check if we have previous results to show
+        if os.path.exists(self.results_file):
+            with open(self.results_file, 'r') as f:
+                results = json.load(f)
+
+            if results:
+                # Show results summary
+                alive = sum(1 for r in results if r.get('status') == 'Alive')
+                formats = {r.get('format', 'Unknown'): 0 for r in results if r.get('status') == 'Alive'}
+                for r in results:
+                    if r.get('status') == 'Alive':
+                        formats[r.get('format', 'Unknown')] += 1
+
+                summary = [
+                    f"📊 Last Check Results ({len(results)} streams):",
+                    f"✅ Alive: {alive}",
+                    f"❌ Dead: {len(results) - alive}\n",
+                    "📺 Alive Stream Formats:"
+                ]
+                for fmt, count in sorted(formats.items()):
+                    if count > 0:
+                        summary.append(f"  • {fmt}: {count}")
+
+                summary.append("\n💡 Click again to start a new check.")
+                return {"status": "success", "message": "\n".join(summary)}
+
+        # No check running and no results - start a new check
+        return self.check_streams_action(settings, logger, context)
+
     def _get_api_token(self, settings, logger, force_refresh=False):
         """Get an API access token using username and password with caching."""
         # Check if we have a valid cached token
@@ -437,7 +567,7 @@ class Plugin:
             timeout = settings.get("timeout", 10)
             retries = settings.get("dead_connection_retries", 3)
             parallel_enabled = settings.get("enable_parallel_checking", False)
-            parallel_workers = settings.get("parallel_workers", 5)
+            parallel_workers = settings.get("parallel_workers", 2)
 
             # Estimate time based on mode
             if parallel_enabled:
@@ -488,7 +618,7 @@ class Plugin:
         # Return immediately to avoid timeout, processing continues in background
         timeout = settings.get("timeout", 10)
         parallel_enabled = settings.get("enable_parallel_checking", False)
-        parallel_workers = settings.get("parallel_workers", 5)
+        parallel_workers = settings.get("parallel_workers", 2)
 
         # Calculate estimated time based on mode
         if parallel_enabled:
@@ -603,7 +733,7 @@ class Plugin:
         results = []
         timeout = settings.get("timeout", 10)
         retries = settings.get("dead_connection_retries", 3)
-        workers = settings.get("parallel_workers", 5)
+        workers = settings.get("parallel_workers", 2)
 
         # Thread-safe data structures
         import threading
@@ -882,38 +1012,6 @@ class Plugin:
             updated_count = self._perform_bulk_patch(token, settings, logger, payload)
             self._trigger_m3u_refresh(token, settings, logger)
             return {"status": "success", "message": f"Successfully added format suffixes to {updated_count} channels. GUI refresh triggered."}
-
-        except Exception as e: return {"status": "error", "message": str(e)}
-
-    def remove_tags_action(self, settings, logger):
-        """Removes all text within square brackets from channel names."""
-        if not os.path.exists(self.loaded_channels_file):
-            return {"status": "error", "message": "No channels loaded. Please run 'Load Group(s)' first."}
-
-        with open(self.loaded_channels_file, 'r') as f: loaded_channels = json.load(f)
-
-        if not loaded_channels: return {"status": "success", "message": "No channels loaded to process."}
-
-        payload = []
-        for channel in loaded_channels:
-            current_name = channel.get('name')
-            if not current_name: continue
-            
-            new_name = re.sub(r'\s*\[.*?\]', '', current_name).strip()
-
-            if new_name != current_name:
-                payload.append({'id': channel['id'], 'name': new_name})
-
-        if not payload:
-            return {"status": "success", "message": "No channels with [] tags were found to update."}
-            
-        try:
-            token, error = self._get_api_token(settings, logger)
-            if error: return {"status": "error", "message": error}
-            
-            updated_count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
-            return {"status": "success", "message": f"Successfully removed tags from {updated_count} channels. GUI refresh triggered."}
 
         except Exception as e: return {"status": "error", "message": str(e)}
 
