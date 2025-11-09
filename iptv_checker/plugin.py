@@ -13,6 +13,7 @@ import csv
 import time
 import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Setup logging using Dispatcharr's format
 LOGGER = logging.getLogger("plugins.iptv_checker")
@@ -29,7 +30,7 @@ class Plugin:
     # Explicitly set the plugin key
     key = "iptv_checker"
     name = "IPTV Checker"
-    version = "0.2.1"
+    version = "0.3.0"
     description = "Check stream status and quality for channels in specified Dispatcharr groups."
     
     fields = [
@@ -125,6 +126,20 @@ class Plugin:
             "type": "string",
             "default": "4k, FHD, HD, SD, Unknown",
             "help_text": "A comma-separated list of formats to add as a suffix (e.g., [HD]) to channel names.",
+        },
+        {
+            "id": "enable_parallel_checking",
+            "label": "Enable Parallel Stream Checking",
+            "type": "boolean",
+            "default": False,
+            "help_text": "Check multiple streams simultaneously for significantly faster processing. Recommended for large channel lists.",
+        },
+        {
+            "id": "parallel_workers",
+            "label": "Number of Parallel Workers",
+            "type": "number",
+            "default": 5,
+            "help_text": "Number of streams to check simultaneously when parallel checking is enabled. Default: 5. Higher values = faster but more resource-intensive.",
         }
     ]
     
@@ -207,6 +222,9 @@ class Plugin:
         self.pending_status_message = None
         self.completion_message = None
         self.timeout_retry_queue = []  # Queue for streams that timed out and need retry
+        self.cached_token = None  # Cached API token
+        self.token_cache_time = None  # Time when token was cached
+        self.token_cache_duration = 3600  # Cache token for 1 hour (3600 seconds)
         LOGGER.info(f"{self.name} Plugin v{self.version} initialized")
 
     def run(self, action, params, context):
@@ -319,8 +337,15 @@ class Plugin:
                 logger = context.get("logger", LOGGER)
                 logger.info(f"STATUS UPDATE READY: {self.pending_status_message}")
             
-    def _get_api_token(self, settings, logger):
-        """Get an API access token using username and password."""
+    def _get_api_token(self, settings, logger, force_refresh=False):
+        """Get an API access token using username and password with caching."""
+        # Check if we have a valid cached token
+        if not force_refresh and self.cached_token and self.token_cache_time:
+            time_elapsed = time.time() - self.token_cache_time
+            if time_elapsed < self.token_cache_duration:
+                logger.debug(f"Using cached API token (age: {time_elapsed:.0f}s)")
+                return self.cached_token, None
+
         dispatcharr_url = settings.get("dispatcharr_url", "").strip().rstrip('/')
         username = settings.get("dispatcharr_username", "")
         password = settings.get("dispatcharr_password", "")
@@ -334,15 +359,22 @@ class Plugin:
             response = requests.post(url, json=payload, timeout=15)
 
             if response.status_code == 401:
+                # Invalidate cache on auth failure
+                self.cached_token = None
+                self.token_cache_time = None
                 return None, "Authentication failed. Please check your username and password."
-            
+
             response.raise_for_status()
             access_token = response.json().get("access")
 
             if not access_token:
                 return None, "Login successful, but no access token was returned by the API."
-            
-            logger.info("Successfully obtained API access token.")
+
+            # Cache the token
+            self.cached_token = access_token
+            self.token_cache_time = time.time()
+
+            logger.info("Successfully obtained and cached API access token.")
             return access_token, None
         except requests.exceptions.ConnectionError as e:
             return None, f"Unable to connect to the Dispatcharr URL: {e}"
@@ -415,18 +447,31 @@ class Plugin:
 
             total_streams = sum(len(c.get('streams', [])) for c in loaded_channels)
             group_msg = "all groups" if not group_names_str else f"group(s): {', '.join(target_group_names)}"
-            
+
             timeout = settings.get("timeout", 10)
             retries = settings.get("dead_connection_retries", 3)
-            # More realistic estimate: ~8-10 seconds average per stream + 20% buffer
-            estimated_seconds = total_streams * 8.5 * 1.2  # Add 20% extra time
+            parallel_enabled = settings.get("enable_parallel_checking", False)
+            parallel_workers = settings.get("parallel_workers", 5)
+
+            # Estimate time based on mode
+            if parallel_enabled:
+                # Parallel mode: divide by workers, account for overhead
+                estimated_seconds = (total_streams / parallel_workers) * 8.5 * 1.1  # 10% overhead
+                mode_info = f" (parallel mode with {parallel_workers} workers)"
+            else:
+                # Sequential mode: ~8-10 seconds average per stream + 20% buffer
+                estimated_seconds = total_streams * 8.5 * 1.2  # 20% extra time
+                mode_info = " (sequential mode)"
+
             estimated_minutes = estimated_seconds / 60
-            
+
             message = f"Successfully loaded {len(loaded_channels)} channels with {total_streams} streams from {group_msg}."
             if 'invalid_names' in locals() and invalid_names:
                 message += f"\n\nWarning: Ignored groups not found: {', '.join(invalid_names)}"
             if total_streams > 0:
-                message += f"\n\nNext, run 'Check Streams'. Estimated time: {estimated_minutes:.0f} minutes."
+                message += f"\n\nNext, run 'Check Streams'. Estimated time{mode_info}: {estimated_minutes:.0f} minutes."
+                if not parallel_enabled and total_streams > 50:
+                    message += f"\n\nTip: Enable 'Parallel Stream Checking' in settings to speed up processing significantly!"
 
             return {"status": "success", "message": message}
         except Exception as e: return {"status": "error", "message": str(e)}
@@ -456,21 +501,39 @@ class Plugin:
         
         # Return immediately to avoid timeout, processing continues in background
         timeout = settings.get("timeout", 10)
-        estimated_total_time = len(all_streams) * 8.5 * 1.2 / 60  # More realistic estimate with 20% buffer
-        
+        parallel_enabled = settings.get("enable_parallel_checking", False)
+        parallel_workers = settings.get("parallel_workers", 5)
+
+        # Calculate estimated time based on mode
+        if parallel_enabled:
+            estimated_total_time = (len(all_streams) / parallel_workers) * 8.5 * 1.1 / 60  # 10% overhead
+            mode_info = f" (parallel mode with {parallel_workers} workers)"
+        else:
+            estimated_total_time = len(all_streams) * 8.5 * 1.2 / 60  # 20% buffer
+            mode_info = " (sequential mode)"
+
         # Start the actual processing in background
         import threading
         processing_thread = threading.Thread(
-            target=self._process_streams_background, 
+            target=self._process_streams_background,
             args=(all_streams, settings, logger)
         )
         processing_thread.daemon = True
         processing_thread.start()
-        
-        return {"status": "success", "message": f"Stream checking started for {len(all_streams)} streams.\nEstimated completion time: {estimated_total_time:.0f} minutes.\n\nUse 'Get Status Update' or 'View Last Results' to monitor progress."}
+
+        return {"status": "success", "message": f"Stream checking started for {len(all_streams)} streams.\nEstimated completion time{mode_info}: {estimated_total_time:.0f} minutes.\n\nUse 'Get Status Update' or 'View Last Results' to monitor progress."}
 
     def _process_streams_background(self, all_streams, settings, logger):
         """Background processing of streams to avoid request timeout"""
+        enable_parallel = settings.get("enable_parallel_checking", False)
+
+        if enable_parallel:
+            self._process_streams_parallel(all_streams, settings, logger)
+        else:
+            self._process_streams_sequential(all_streams, settings, logger)
+
+    def _process_streams_sequential(self, all_streams, settings, logger):
+        """Sequential stream processing (original implementation)"""
         results = []
         timeout = settings.get("timeout", 10)
         retries = settings.get("dead_connection_retries", 3)
@@ -481,42 +544,42 @@ class Plugin:
             for i, stream_data in enumerate(all_streams):
                 if self.stop_status_updates:  # Allow early termination
                     break
-                    
+
                 self.check_progress["current"] = i + 1
-                
+
                 # Check stream - NO immediate retries, we'll handle them in the background queue
                 result = self.check_stream(stream_data, timeout, 0, logger, skip_retries=True)
-                
+
                 # If stream timed out and we have retries enabled, add to retry queue
                 if result.get('error_type') == 'Timeout' and retries > 0:
                     self.timeout_retry_queue.append({**stream_data, "retry_count": 0})
                     logger.info(f"Added '{stream_data.get('channel_name')}' to retry queue due to timeout")
-                
+
                 results.append({**stream_data, **result})
                 streams_processed_since_retry += 1
-                
+
                 # Process timeout retry queue every 4 streams
                 if streams_processed_since_retry >= 4 and self.timeout_retry_queue:
                     retry_stream = self.timeout_retry_queue.pop(0)
                     retry_stream["retry_count"] += 1
-                    
+
                     if retry_stream["retry_count"] <= retries:
                         logger.info(f"Retrying timeout stream: '{retry_stream.get('channel_name')}' (attempt {retry_stream['retry_count']}/{retries})")
                         retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True)  # No immediate retries
-                        
+
                         # Update the original result in the results list
                         for j, existing_result in enumerate(results):
-                            if (existing_result.get('channel_id') == retry_stream.get('channel_id') and 
+                            if (existing_result.get('channel_id') == retry_stream.get('channel_id') and
                                 existing_result.get('stream_id') == retry_stream.get('stream_id')):
                                 results[j] = {**retry_stream, **retry_result}
                                 break
-                        
+
                         # If still timing out, add back to queue for another retry
                         if retry_result.get('error_type') == 'Timeout' and retry_stream["retry_count"] < retries:
                             self.timeout_retry_queue.append(retry_stream)
-                    
+
                     streams_processed_since_retry = 0
-                
+
                 # Add 3 second delay between stream checks
                 time.sleep(3)
 
@@ -527,26 +590,130 @@ class Plugin:
                     retry_stream["retry_count"] += 1
                     logger.info(f"Final retry for timeout stream: '{retry_stream.get('channel_name')}' (attempt {retry_stream['retry_count']}/{retries})")
                     retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True)
-                    
+
                     # Update the original result in the results list
                     for j, existing_result in enumerate(results):
-                        if (existing_result.get('channel_id') == retry_stream.get('channel_id') and 
+                        if (existing_result.get('channel_id') == retry_stream.get('channel_id') and
                             existing_result.get('stream_id') == retry_stream.get('stream_id')):
                             results[j] = {**retry_stream, **retry_result}
                             break
 
-            with open(self.results_file, 'w') as f: 
+            with open(self.results_file, 'w') as f:
                 json.dump(results, f, indent=2)
-                
+
         except Exception as e:
             logger.error(f"Background stream processing error: {e}")
         finally:
             self.check_progress['status'] = 'idle'
             self._stop_status_updates()
-            
+
             # Set completion message
             processed_count = len(results)
             self.completion_message = f"Stream checking completed. Processed {processed_count} streams."
+            logger.info(f"Stream checking completed. Processed {processed_count} streams.")
+
+    def _process_streams_parallel(self, all_streams, settings, logger):
+        """Parallel stream processing using ThreadPoolExecutor"""
+        results = []
+        timeout = settings.get("timeout", 10)
+        retries = settings.get("dead_connection_retries", 3)
+        workers = settings.get("parallel_workers", 5)
+
+        # Thread-safe data structures
+        import threading
+        results_lock = threading.Lock()
+        results_dict = {}  # Use dict to track results by stream index
+
+        try:
+            logger.info(f"Starting parallel stream checking with {workers} workers")
+
+            # First pass: check all streams in parallel
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                # Submit all stream checks
+                future_to_index = {
+                    executor.submit(self.check_stream, stream_data, timeout, 0, logger, skip_retries=True): i
+                    for i, stream_data in enumerate(all_streams)
+                }
+
+                # Process results as they complete
+                for future in as_completed(future_to_index):
+                    if self.stop_status_updates:
+                        executor.shutdown(wait=False)
+                        break
+
+                    index = future_to_index[future]
+                    stream_data = all_streams[index]
+
+                    try:
+                        result = future.result()
+
+                        with results_lock:
+                            results_dict[index] = {**stream_data, **result}
+                            self.check_progress["current"] = len(results_dict)
+
+                    except Exception as e:
+                        logger.error(f"Error checking stream '{stream_data.get('channel_name')}': {e}")
+                        with results_lock:
+                            results_dict[index] = {
+                                **stream_data,
+                                'status': 'Dead',
+                                'error': str(e),
+                                'error_type': 'Other',
+                                'format': 'N/A',
+                                'framerate_num': 0
+                            }
+                            self.check_progress["current"] = len(results_dict)
+
+            # Rebuild results list in original order
+            results = [results_dict[i] for i in range(len(all_streams)) if i in results_dict]
+
+            # Handle retries for timeout streams if enabled
+            if retries > 0:
+                timeout_streams = [(i, r) for i, r in enumerate(results) if r.get('error_type') == 'Timeout']
+
+                if timeout_streams:
+                    logger.info(f"Found {len(timeout_streams)} timeout streams, retrying...")
+
+                    for retry_attempt in range(retries):
+                        if not timeout_streams:
+                            break
+
+                        logger.info(f"Retry attempt {retry_attempt + 1}/{retries} for {len(timeout_streams)} streams")
+
+                        with ThreadPoolExecutor(max_workers=workers) as executor:
+                            future_to_result_index = {
+                                executor.submit(
+                                    self.check_stream,
+                                    {k: v for k, v in result.items() if k in ['channel_id', 'channel_name', 'stream_url', 'stream_id']},
+                                    timeout, 0, logger, skip_retries=True
+                                ): result_index
+                                for result_index, result in timeout_streams
+                            }
+
+                            for future in as_completed(future_to_result_index):
+                                result_index = future_to_result_index[future]
+                                try:
+                                    retry_result = future.result()
+                                    # Update the result
+                                    results[result_index] = {**results[result_index], **retry_result}
+                                except Exception as e:
+                                    logger.error(f"Error during retry: {e}")
+
+                        # Find remaining timeout streams for next retry
+                        timeout_streams = [(i, r) for i, r in enumerate(results) if r.get('error_type') == 'Timeout']
+
+            with open(self.results_file, 'w') as f:
+                json.dump(results, f, indent=2)
+
+        except Exception as e:
+            logger.error(f"Background parallel stream processing error: {e}")
+        finally:
+            self.check_progress['status'] = 'idle'
+            self._stop_status_updates()
+
+            # Set completion message
+            processed_count = len(results)
+            self.completion_message = f"Stream checking completed. Processed {processed_count} streams (parallel mode with {workers} workers)."
             logger.info(f"Stream checking completed. Processed {processed_count} streams.")
 
     def rename_channels_action(self, settings, logger):
