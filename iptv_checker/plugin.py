@@ -36,7 +36,7 @@ class Plugin:
     fields = [
         {
             "id": "dispatcharr_url",
-            "label": "Dispatcharr URL",
+            "label": "🌐 Dispatcharr URL",
             "type": "string",
             "default": "",
             "placeholder": "http://192.168.1.10:9191",
@@ -44,99 +44,85 @@ class Plugin:
         },
         {
             "id": "dispatcharr_username",
-            "label": "Dispatcharr Admin Username",
+            "label": "👤 Dispatcharr Admin Username",
             "type": "string",
             "help_text": "Your admin username for the Dispatcharr UI. Required for WRITE operations.",
         },
         {
             "id": "dispatcharr_password",
-            "label": "Dispatcharr Admin Password",
+            "label": "🔑 Dispatcharr Admin Password",
             "type": "string",
             "input_type": "password",
             "help_text": "Your admin password for the Dispatcharr UI. Required for WRITE operations.",
         },
         {
             "id": "group_names",
-            "label": "Group(s) to Check (comma-separated)",
+            "label": "📂 Group(s) to Check (comma-separated)",
             "type": "string",
             "default": "",
             "help_text": "The name of the Dispatcharr Channel Group(s) to check. Leave blank to check all groups.",
         },
         {
             "id": "timeout",
-            "label": "Connection Timeout (seconds)",
+            "label": "⏱️ Connection Timeout (seconds)",
             "type": "number",
             "default": 10,
             "help_text": "Timeout for each stream connection attempt. Default: 10",
         },
         {
             "id": "dead_connection_retries",
-            "label": "Dead Connection Retries",
+            "label": "🔄 Dead Connection Retries",
             "type": "number",
             "default": 3,
             "help_text": "Number of times to retry checking a stream if it appears to be dead. Default: 3",
         },
         {
-            "id": "dead_prefix",
-            "label": "Dead Channel Prefix",
+            "id": "dead_rename_format",
+            "label": "💀 Dead Channel Rename Format",
             "type": "string",
-            "default": "",
-            "placeholder": "[DEAD] ",
-            "help_text": "Prefix to add to dead channels (e.g., '[DEAD] ').",
-        },
-        {
-            "id": "dead_suffix",
-            "label": "Dead Channel Suffix",
-            "type": "string",
-            "default": "",
-            "placeholder": " [DEAD]",
-            "help_text": "Suffix to add to dead channels (e.g., ' [DEAD]').",
+            "default": "{name} [DEAD]",
+            "placeholder": "[DEAD] {name}",
+            "help_text": "Format for renaming dead channels. Use {name} as placeholder for the original channel name. Examples: '[DEAD] {name}', '{name} [DEAD]', '[X] {name} [DEAD]'",
         },
         {
             "id": "move_to_group_name",
-            "label": "Move Dead Channels to Group",
+            "label": "⚰️ Move Dead Channels to Group",
             "type": "string",
             "default": "Graveyard",
             "help_text": "Enter the name for the group to move dead channels into.",
         },
         {
-            "id": "low_framerate_prefix",
-            "label": "Low Framerate Prefix - Less than 30fps",
+            "id": "low_framerate_rename_format",
+            "label": "🐌 Low Framerate Rename Format - Less than 30fps",
             "type": "string",
-            "default": "",
-            "help_text": "Prefix to add to low framerate channels. (e.g., ' [SLOW]').",
-        },
-        {
-            "id": "low_framerate_suffix",
-            "label": "Low Framerate Suffix - Less than 30fps",
-            "type": "string",
-            "default": " [Slow]",
-            "help_text": "Suffix to add to low framerate channels. (e.g., ' [SLOW]').",
+            "default": "{name} [Slow]",
+            "placeholder": "[SLOW] {name}",
+            "help_text": "Format for renaming low framerate channels. Use {name} as placeholder for the original channel name. Examples: '[SLOW] {name}', '{name} [Slow]'",
         },
         {
             "id": "move_low_framerate_group",
-            "label": "Move Low Framerate Channels to Group",
+            "label": "📁 Move Low Framerate Channels to Group",
             "type": "string",
             "default": "Slow",
             "help_text": "Enter the name for the group to move low framerate channels into.",
         },
         {
             "id": "video_format_suffixes",
-            "label": "Add Video Format Suffixes - [4k], [FHD], [HD], [SD], [Unknown]",
+            "label": "🎬 Add Video Format Suffixes - [4k], [FHD], [HD], [SD], [Unknown]",
             "type": "string",
             "default": "4k, FHD, HD, SD, Unknown",
             "help_text": "A comma-separated list of formats to add as a suffix (e.g., [HD]) to channel names.",
         },
         {
             "id": "enable_parallel_checking",
-            "label": "Enable Parallel Stream Checking",
+            "label": "⚡ Enable Parallel Stream Checking",
             "type": "boolean",
             "default": False,
             "help_text": "Check multiple streams simultaneously for significantly faster processing. Recommended for large channel lists.",
         },
         {
             "id": "parallel_workers",
-            "label": "Number of Parallel Workers",
+            "label": "👷 Number of Parallel Workers",
             "type": "number",
             "default": 5,
             "help_text": "Number of streams to check simultaneously when parallel checking is enabled. Default: 5. Higher values = faster but more resource-intensive.",
@@ -168,7 +154,7 @@ class Plugin:
         {
             "id": "rename_channels",
             "label": "Rename Dead Channels",
-            "description": "Rename all channels marked as 'Dead' in the last check, based on prefix/suffix settings.",
+            "description": "Rename all channels marked as 'Dead' in the last check using the configured rename format.",
             "confirm": { "required": True, "title": "Rename Dead Channels?", "message": "This action is irreversible. Continue?" }
         },
         {
@@ -180,7 +166,7 @@ class Plugin:
         {
             "id": "rename_low_framerate_channels",
             "label": "Rename Low Framerate Channels",
-            "description": "Rename channels with streams under 30fps based on prefix/suffix settings.",
+            "description": "Rename channels with streams under 30fps using the configured rename format.",
             "confirm": { "required": True, "title": "Rename Low Framerate Channels?", "message": "This action is irreversible. Continue?" }
         },
         {
@@ -718,32 +704,30 @@ class Plugin:
 
     def rename_channels_action(self, settings, logger):
         """Rename channels that were marked as dead in the last check."""
-        dead_prefix = settings.get("dead_prefix", "")
-        dead_suffix = settings.get("dead_suffix", "")
-        if not dead_prefix.strip() and not dead_suffix.strip():
-            return {"status": "error", "message": "Please configure a Dead Channel Prefix or Suffix before renaming."}
+        rename_format = settings.get("dead_rename_format", "").strip()
+        if not rename_format:
+            return {"status": "error", "message": "Please configure a Dead Channel Rename Format before renaming."}
+
+        if "{name}" not in rename_format:
+            return {"status": "error", "message": "Dead Channel Rename Format must contain {name} placeholder."}
 
         if not os.path.exists(self.results_file):
             return {"status": "error", "message": "No check results found. Please run 'Check Streams' first."}
-            
+
         with open(self.results_file, 'r') as f: results = json.load(f)
-            
+
         dead_channels = {r['channel_id']: r['channel_name'] for r in results if r['status'] == 'Dead'}
         if not dead_channels: return {"status": "success", "message": "No dead channels found in the last check."}
-            
+
         payload = []
         for cid, name in dead_channels.items():
-            new_name = name
-            if dead_prefix and not name.startswith(dead_prefix):
-                new_name = f"{dead_prefix}{new_name}"
-            if dead_suffix and not new_name.endswith(dead_suffix):
-                new_name = f"{new_name}{dead_suffix}"
-            
-            if new_name != name: 
+            new_name = rename_format.replace('{name}', name)
+
+            if new_name != name:
                 payload.append({'id': cid, 'name': new_name})
-        
+
         if not payload: return {"status": "success", "message": "No channels needed renaming."}
-            
+
         try:
             token, error = self._get_api_token(settings, logger)
             if error: return {"status": "error", "message": error}
@@ -791,33 +775,31 @@ class Plugin:
         
     def rename_low_framerate_channels_action(self, settings, logger):
         """Rename channels with low framerate streams."""
-        prefix = settings.get("low_framerate_prefix", "")
-        suffix = settings.get("low_framerate_suffix", " [Slow]")
-        
-        if not prefix.strip() and not suffix.strip():
-            return {"status": "error", "message": "Please configure a Low Framerate Prefix or Suffix."}
+        rename_format = settings.get("low_framerate_rename_format", "").strip()
+
+        if not rename_format:
+            return {"status": "error", "message": "Please configure a Low Framerate Rename Format."}
+
+        if "{name}" not in rename_format:
+            return {"status": "error", "message": "Low Framerate Rename Format must contain {name} placeholder."}
 
         if not os.path.exists(self.results_file):
             return {"status": "error", "message": "No check results found. Please run 'Check Streams' first."}
-            
+
         with open(self.results_file, 'r') as f: results = json.load(f)
-            
+
         low_fps_channels = {r['channel_id']: r['channel_name'] for r in results if 0 < r.get('framerate_num', 0) < 30}
         if not low_fps_channels: return {"status": "success", "message": "No low framerate channels found."}
-            
+
         payload = []
         for cid, name in low_fps_channels.items():
-            new_name = name
-            if prefix and not name.startswith(prefix):
-                new_name = f"{prefix}{new_name}"
-            if suffix and not new_name.endswith(suffix):
-                new_name = f"{new_name}{suffix}"
+            new_name = rename_format.replace('{name}', name)
 
             if new_name != name:
                 payload.append({'id': cid, 'name': new_name})
-        
+
         if not payload: return {"status": "success", "message": "No channels needed renaming."}
-            
+
         try:
             token, error = self._get_api_token(settings, logger)
             if error: return {"status": "error", "message": error}
