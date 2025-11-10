@@ -134,6 +134,13 @@ class Plugin:
             "default": "-show_streams",
             "placeholder": "-show_streams, -show_frames, -show_packets",
             "help_text": "Comma-separated ffprobe flags for stream analysis. Options: -show_streams (basic validation), -show_frames (GOP/timestamps), -show_packets (bitrate), -loglevel error (errors only). Default: -show_streams",
+        },
+        {
+            "id": "ffprobe_analysis_duration",
+            "label": "⏱️ FFprobe Analysis Duration (seconds)",
+            "type": "number",
+            "default": 5,
+            "help_text": "Duration to analyze stream when using -show_frames or -show_packets. Longer duration = more accurate bitrate/GOP analysis but slower checks. Default: 5 seconds",
         }
     ]
     
@@ -443,6 +450,13 @@ class Plugin:
 
         ffprobe_flags = settings.get("ffprobe_flags", "-show_streams")
         validation_results.append(f"✅ FFprobe Flags: {ffprobe_flags}")
+
+        analysis_duration = settings.get("ffprobe_analysis_duration", 5)
+        if analysis_duration <= 0:
+            validation_results.append(f"⚠️ FFprobe Analysis Duration should be greater than 0 (current: {analysis_duration})")
+            has_errors = True
+        else:
+            validation_results.append(f"✅ FFprobe Analysis Duration: {analysis_duration} seconds")
 
         # Return results
         status = "error" if has_errors else "success"
@@ -1171,6 +1185,7 @@ class Plugin:
         lines.append(f"#   Parallel Checking Enabled: {settings.get('enable_parallel_checking', False)}")
         lines.append(f"#   Parallel Workers: {settings.get('parallel_workers', 2)}")
         lines.append(f"#   FFprobe Flags: {settings.get('ffprobe_flags', '-show_streams')}")
+        lines.append(f"#   FFprobe Analysis Duration: {settings.get('ffprobe_analysis_duration', 5)} seconds")
         lines.append("#")
 
         # Calculate cumulative statistics
@@ -1372,12 +1387,22 @@ class Plugin:
         if '-show_streams' not in cmd:
             cmd.append('-show_streams')
 
+        # If using frame or packet analysis, add duration limit
+        analysis_duration = 0
+        if any(flag in cmd for flag in ['-show_frames', '-show_packets']):
+            analysis_duration = settings.get('ffprobe_analysis_duration', 5) if settings else 5
+            cmd.extend(['-t', str(analysis_duration)])
+            logger.debug(f"Added analysis duration: {analysis_duration} seconds for frame/packet analysis")
+
         # Add URL at the end
         cmd.append(url)
 
+        # Calculate total timeout: connection timeout + analysis duration + 2 second buffer
+        total_timeout = timeout + analysis_duration + 2
+
         for attempt in range(max_attempts):
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=total_timeout)
                 
                 if result.returncode == 0:
                     probe_data = json.loads(result.stdout)
