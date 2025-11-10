@@ -12,6 +12,8 @@ import re
 import csv
 import time
 import threading
+import urllib.request
+import urllib.error
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -35,8 +37,23 @@ class Plugin:
     name = "IPTV Checker"
     version = "0.3.0"
     description = "Check stream status and quality for channels in specified Dispatcharr groups."
-    
-    fields = [
+
+    @property
+    def fields(self):
+        """
+        Dynamically generate fields including version check status.
+        This property is called every time the user opens the plugin settings page.
+        """
+        # Perform version check (uses cache if checked within last 24 hours)
+        _, version_message = self._get_latest_version()
+
+        return [
+            {
+                "id": "version_status",
+                "label": "📦 Plugin Version",
+                "type": "info",
+                "help_text": version_message,
+            },
         {
             "id": "dispatcharr_url",
             "label": "🌐 Dispatcharr URL",
@@ -146,7 +163,7 @@ class Plugin:
             "help_text": "Duration to analyze stream when using -show_frames or -show_packets. Longer duration = more accurate bitrate/GOP analysis but slower checks. Default: 5 seconds",
         }
     ]
-    
+
     actions = [
         {
             "id": "validate_settings",
@@ -240,6 +257,9 @@ class Plugin:
         self.cached_token = None  # Cached API token
         self.token_cache_time = None  # Time when token was cached
         self.token_cache_duration = 3600  # Cache token for 1 hour (3600 seconds)
+        self.version_check_cache = None  # Cached version check result
+        self.version_check_time = None  # Time when version was last checked
+        self.version_check_duration = 86400  # Check version once per day (24 hours)
         LOGGER.info(f"Plugin v{self.version} initialized")
 
     def _load_progress(self):
@@ -259,6 +279,96 @@ class Plugin:
                 json.dump(self.check_progress, f)
         except Exception as e:
             LOGGER.error(f"Failed to save progress file: {e}")
+
+    def _get_latest_version(self, owner="PiratesIRC", repo="Dispatcharr-IPTV-Checker-Plugin"):
+        """
+        Fetches the latest release tag from GitHub using only Python's standard library.
+        Returns a tuple: (latest_version_tag, status_message)
+        Caches the result for 24 hours to avoid excessive API calls.
+        """
+        # Check if we have a valid cached result
+        if self.version_check_cache and self.version_check_time:
+            time_elapsed = time.time() - self.version_check_time
+            if time_elapsed < self.version_check_duration:
+                LOGGER.debug(f"Using cached version check (age: {time_elapsed:.0f}s)")
+                return self.version_check_cache
+
+        # Prepare to fetch latest version from GitHub
+        url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+        headers = {'User-Agent': 'Dispatcharr-Plugin-Version-Checker'}
+
+        try:
+            # Create request with headers
+            req = urllib.request.Request(url, headers=headers)
+
+            # Make the request with a 5-second timeout
+            with urllib.request.urlopen(req, timeout=5) as response:
+                # Read and decode the response
+                data = response.read().decode('utf-8')
+                json_data = json.loads(data)
+
+                # Get the tag name (version)
+                latest_version = json_data.get("tag_name", "").strip()
+
+                if not latest_version:
+                    result = (None, "ℹ️ Version Check: Unable to determine latest version")
+                    self.version_check_cache = result
+                    self.version_check_time = time.time()
+                    return result
+
+                # Remove 'v' prefix if present for comparison
+                latest_clean = latest_version.lstrip('v')
+                current_clean = self.version.lstrip('v')
+
+                # Compare versions
+                if latest_clean == current_clean:
+                    message = f"✅ Version Status: You are up to date (v{self.version})"
+                else:
+                    # Simple version comparison (works for semantic versioning)
+                    try:
+                        latest_parts = [int(x) for x in latest_clean.split('.')]
+                        current_parts = [int(x) for x in current_clean.split('.')]
+
+                        # Pad shorter version with zeros
+                        max_len = max(len(latest_parts), len(current_parts))
+                        latest_parts += [0] * (max_len - len(latest_parts))
+                        current_parts += [0] * (max_len - len(current_parts))
+
+                        if latest_parts > current_parts:
+                            message = f"🔔 Update Available: v{latest_version} is available (current: v{self.version})"
+                        else:
+                            message = f"✅ Version Status: You are up to date (v{self.version})"
+                    except (ValueError, AttributeError):
+                        # Fallback to string comparison if version parsing fails
+                        if latest_version != self.version:
+                            message = f"🔔 Update Available: v{latest_version} is available (current: v{self.version})"
+                        else:
+                            message = f"✅ Version Status: You are up to date (v{self.version})"
+
+                result = (latest_version, message)
+                self.version_check_cache = result
+                self.version_check_time = time.time()
+                LOGGER.info(f"Version check completed: {message}")
+                return result
+
+        except urllib.error.HTTPError as http_err:
+            if http_err.code == 404:
+                error_msg = "ℹ️ Version Check: Repository not found or has no releases"
+            else:
+                error_msg = f"ℹ️ Version Check: HTTP error {http_err.code}"
+            result = (None, error_msg)
+            self.version_check_cache = result
+            self.version_check_time = time.time()
+            LOGGER.warning(f"Version check failed: {error_msg}")
+            return result
+        except Exception as e:
+            # Catch all other errors (timeout, network issues, etc.)
+            error_msg = f"ℹ️ Version Check: Unable to check for updates (current: v{self.version})"
+            result = (None, error_msg)
+            self.version_check_cache = result
+            self.version_check_time = time.time()
+            LOGGER.debug(f"Version check error: {str(e)}")
+            return result
 
     def run(self, action, params, context):
         """Main plugin entry point"""
@@ -1535,6 +1645,6 @@ plugin_instance = _plugin_instance
 iptv_checker = _plugin_instance
 IPTV_CHECKER = _plugin_instance
 
-# Export class-level attributes
-fields = Plugin.fields
+# Export class-level attributes (fields is now a property, so access via instance)
+fields = _plugin_instance.fields
 actions = Plugin.actions
