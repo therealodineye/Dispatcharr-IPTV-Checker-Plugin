@@ -388,7 +388,7 @@ class Plugin:
             validation_results.append("❌ Dispatcharr URL is not configured")
             has_errors = True
         else:
-            validation_results.append(f"✅ Dispatcharr URL configured: {dispatcharr_url}")
+            validation_results.append(f"✅ URL: {dispatcharr_url}")
 
         # Validate credentials
         username = settings.get("dispatcharr_username", "").strip()
@@ -398,13 +398,13 @@ class Plugin:
             validation_results.append("❌ Admin Username is not configured")
             has_errors = True
         else:
-            validation_results.append(f"✅ Admin Username configured: {username}")
+            validation_results.append(f"✅ Username: {username}")
 
         if not password:
             validation_results.append("❌ Admin Password is not configured")
             has_errors = True
         else:
-            validation_results.append("✅ Admin Password is configured")
+            validation_results.append("✅ Password configured")
 
         # Test API connection if credentials are provided
         if dispatcharr_url and username and password:
@@ -414,7 +414,7 @@ class Plugin:
                     validation_results.append(f"❌ API Connection Failed: {error}")
                     has_errors = True
                 else:
-                    validation_results.append("✅ API Connection successful")
+                    validation_results.append("✅ API connected")
 
                     # Validate groups if specified
                     group_names_str = settings.get("group_names", "").strip()
@@ -427,52 +427,43 @@ class Plugin:
                             invalid_names = input_names - valid_names
 
                             if valid_names:
-                                validation_results.append(f"✅ Valid groups found: {', '.join(valid_names)}")
+                                validation_results.append(f"✅ Groups: {', '.join(valid_names)}")
                             if invalid_names:
-                                validation_results.append(f"⚠️ Invalid groups (not found): {', '.join(invalid_names)}")
+                                validation_results.append(f"⚠️ Invalid groups: {', '.join(invalid_names)}")
                                 has_errors = True
                         except Exception as e:
                             validation_results.append(f"❌ Failed to validate groups: {str(e)}")
                             has_errors = True
                     else:
-                        validation_results.append("ℹ️ No specific groups configured (will check all groups)")
+                        validation_results.append("ℹ️ No groups specified (will check all)")
             except Exception as e:
                 validation_results.append(f"❌ Validation error: {str(e)}")
                 has_errors = True
 
-        # Validate other settings
+        # Validate other settings - simplified display
         timeout = settings.get("timeout", 10)
         if timeout <= 0:
-            validation_results.append(f"⚠️ Connection Timeout should be greater than 0 (current: {timeout})")
+            validation_results.append(f"⚠️ Timeout must be > 0 (current: {timeout})")
             has_errors = True
-        else:
-            validation_results.append(f"✅ Connection Timeout: {timeout} seconds")
 
         parallel_workers = settings.get("parallel_workers", 2)
         if parallel_workers < 1:
-            validation_results.append(f"⚠️ Parallel Workers should be at least 1 (current: {parallel_workers})")
+            validation_results.append(f"⚠️ Workers must be >= 1 (current: {parallel_workers})")
             has_errors = True
-        else:
-            validation_results.append(f"✅ Parallel Workers: {parallel_workers}")
-
-        ffprobe_flags = settings.get("ffprobe_flags", "-show_streams")
-        validation_results.append(f"✅ FFprobe Flags: {ffprobe_flags}")
 
         analysis_duration = settings.get("ffprobe_analysis_duration", 5)
         if analysis_duration <= 0:
-            validation_results.append(f"⚠️ FFprobe Analysis Duration should be greater than 0 (current: {analysis_duration})")
+            validation_results.append(f"⚠️ Analysis duration must be > 0 (current: {analysis_duration})")
             has_errors = True
-        else:
-            validation_results.append(f"✅ FFprobe Analysis Duration: {analysis_duration} seconds")
 
         # Return results
         status = "error" if has_errors else "success"
         message = "\n".join(validation_results)
 
         if has_errors:
-            message += "\n\n⚠️ Please fix the errors above before using the plugin."
+            message += "\n\n⚠️ Please fix the errors above."
         else:
-            message += "\n\n✅ All settings are valid! You can now use the plugin."
+            message += "\n\n✅ Settings valid. Ready to use!"
 
         return {"status": status, "message": message}
 
