@@ -1375,6 +1375,10 @@ class Plugin:
             'ffprobe_monitoring_seconds': 0
         }
 
+        # Log stream check start at INFO level for debugging
+        retry_info = f" (retry {retry_attempt})" if retry_attempt > 0 else ""
+        logger.info(f"Checking stream{retry_info}: '{channel_name}' - URL: {url}")
+
         # Determine how many attempts to make
         max_attempts = 1 if skip_retries else (retries + 1)
 
@@ -1404,11 +1408,13 @@ class Plugin:
         if '-show_streams' not in cmd:
             cmd.append('-show_streams')
 
-        # If using frame or packet analysis, add duration limit
+        # If using frame or packet analysis, add duration limit using read_intervals
         analysis_duration = 0
         if any(flag in cmd for flag in ['-show_frames', '-show_packets']):
             analysis_duration = settings.get('ffprobe_analysis_duration', 5) if settings else 5
-            cmd.extend(['-t', str(analysis_duration)])
+            # Use -read_intervals which is the correct ffprobe option (not -t which is for ffmpeg)
+            # Format: %+<duration> reads <duration> seconds from the start
+            cmd.extend(['-read_intervals', f'%+{analysis_duration}'])
             logger.debug(f"Added analysis duration: {analysis_duration} seconds for frame/packet analysis")
 
         # Add URL at the end
@@ -1417,10 +1423,13 @@ class Plugin:
         # Calculate total timeout: connection timeout + analysis duration + 2 second buffer
         total_timeout = timeout + analysis_duration + 2
 
+        # Log the ffprobe command being executed at INFO level
+        logger.info(f"Executing ffprobe command for '{channel_name}': {' '.join(cmd)}")
+
         for attempt in range(max_attempts):
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=total_timeout)
-                
+
                 if result.returncode == 0:
                     probe_data = json.loads(result.stdout)
                     video_stream = next((s for s in probe_data.get('streams', []) if s['codec_type'] == 'video'), None)
@@ -1453,11 +1462,14 @@ class Plugin:
                             ffprobe_extra_data['codec'] = video_stream.get('codec_name', 'N/A')
                             ffprobe_extra_data['bitrate'] = video_stream.get('bit_rate', 'N/A')
 
+                        stream_format = self._get_stream_format(resolution)
+                        logger.info(f"✓ Stream ALIVE: '{channel_name}' - Format: {stream_format}, Resolution: {resolution}, FPS: {framerate_num:.1f}, Codec: {ffprobe_extra_data.get('codec', 'N/A')}")
+
                         return {
                             'status': 'Alive',
                             'error': '',
                             'error_type': 'N/A',
-                            'format': self._get_stream_format(resolution),
+                            'format': stream_format,
                             'framerate_num': framerate_num,
                             'ffprobe_data': ffprobe_extra_data,
                             'retry_count': retry_attempt,
@@ -1467,60 +1479,58 @@ class Plugin:
                     else:
                         last_error = 'No video stream found'
                         last_error_type = 'No Video Stream'
+                        logger.info(f"✗ Stream DEAD: '{channel_name}' - Error Type: {last_error_type}, Reason: {last_error}")
                 else:
                     error_output = result.stderr.strip() or 'Stream not accessible'
                     last_error = error_output
-
-                    # Log the actual error for debugging
-                    logger.debug(f"Stream '{channel_name}' failed with return code {result.returncode}")
-                    logger.debug(f"FFprobe stderr: {error_output[:200]}")  # First 200 chars
 
                     # Categorize the error type based on common ffprobe error patterns
                     error_lower = error_output.lower()
                     if 'timed out' in error_lower or 'timeout' in error_lower or 'connection timeout' in error_lower:
                         last_error_type = 'Timeout'
-                        # Keep original error message for debugging
-                    elif '404' in error_output or 'not found' in error_lower or 'no such file' in error_lower:
+                    elif 'option not found' in error_lower or 'unrecognized option' in error_lower:
+                        last_error_type = 'FFprobe Option Error'
+                    elif '404' in error_output or ('not found' in error_lower and 'http' in error_lower):
                         last_error_type = '404 Not Found'
-                        # Keep original error message for debugging
                     elif '403' in error_output or 'forbidden' in error_lower:
                         last_error_type = '403 Forbidden'
-                        # Keep original error message
                     elif '500' in error_output or 'internal server error' in error_lower:
                         last_error_type = 'Server Error'
-                        # Keep original error message
                     elif 'connection refused' in error_lower:
                         last_error_type = 'Connection Refused'
-                        # Keep original error message
                     elif 'network unreachable' in error_lower or 'no route to host' in error_lower:
                         last_error_type = 'Network Unreachable'
-                        # Keep original error message
                     elif 'invalid data found' in error_lower or 'invalid argument' in error_lower:
                         last_error_type = 'Invalid Stream'
-                        # Keep original error message
                     elif 'protocol not supported' in error_lower:
                         last_error_type = 'Unsupported Protocol'
-                        # Keep original error message
                     elif result.returncode == 1:
                         # Common ffprobe return code for unreachable streams
                         last_error_type = 'Stream Unreachable'
-                        # Keep original error message
                     else:
                         last_error_type = 'Other'
-                        # Keep original error message
+
+                    # Log the error at INFO level for debugging
+                    logger.info(f"✗ Stream DEAD: '{channel_name}' - Error Type: {last_error_type}, Return Code: {result.returncode}")
+                    logger.info(f"  FFprobe stderr: {error_output[:300]}")  # First 300 chars for context
                         
-            except subprocess.TimeoutExpired: 
-                last_error = 'Connection timeout'
+            except subprocess.TimeoutExpired:
+                last_error = f'Connection timeout after {total_timeout} seconds'
                 last_error_type = 'Timeout'
-            except Exception as e: 
+                logger.info(f"✗ Stream DEAD: '{channel_name}' - Error Type: {last_error_type}, Reason: Process timeout ({total_timeout}s)")
+            except Exception as e:
                 last_error = str(e)
                 last_error_type = 'Other'
+                logger.info(f"✗ Stream DEAD: '{channel_name}' - Error Type: {last_error_type}, Exception: {last_error}")
 
             # Only do immediate retries if not skipping them and not the last attempt
             if not skip_retries and attempt < max_attempts - 1:
                 logger.info(f"Channel '{channel_name}' stream check failed. Retrying ({attempt+1}/{retries})...")
                 time.sleep(1)
-        
+
+        # Log final result if all attempts failed
+        logger.info(f"Final result for '{channel_name}': DEAD - Error Type: {last_error_type}")
+
         default_return['error'] = last_error
         default_return['error_type'] = last_error_type
         return default_return
