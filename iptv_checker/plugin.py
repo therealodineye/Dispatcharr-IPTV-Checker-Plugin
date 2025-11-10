@@ -1488,7 +1488,7 @@ class Plugin:
         ffprobe_flags = [flag.strip() for flag in ffprobe_flags_str.split(',') if flag.strip()]
 
         # Build base command
-        cmd = ['/usr/local/bin/ffprobe', '-print_format', 'json', '-user_agent', 'IPTVChecker 1.0', '-timeout', str(timeout * 1000000)]
+        cmd = ['/usr/local/bin/ffprobe', '-print_format', 'json', '-user_agent', 'VLC/3.0.21 LibVLC/3.0.21', '-timeout', str(timeout * 1000000)]
 
         # Add loglevel flag if specified, otherwise use default quiet mode
         has_loglevel = any('loglevel' in flag for flag in ffprobe_flags)
