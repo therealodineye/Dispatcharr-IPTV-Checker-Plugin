@@ -2,17 +2,32 @@
 
 **Description:** Check IPTV stream status, analyze stream quality, and manage channels based on results
 
+**Latest Version:** 0.2.1 (Released September 25, 2025)
+
+## What's New in 0.2.1
+
+- **Background Processing:** Stream checks now run in background threads, preventing browser timeouts during long-running checks
+- **Real-Time ETA:** Dynamic ETA calculation based on actual processing speed with live updates
+- **Smart Retry System:** Timeout streams are queued and retried after processing other streams (not immediately), improving success rates
+- **Enhanced Error Categorization:** Detailed error types including Timeout, 404 Not Found, 403 Forbidden, 500 Server Error, Connection Refused, Network Unreachable, Invalid Stream, and more
+- **3-Second Delays:** Added delays between stream checks for server stability and reliability
+- **Improved Time Estimates:** More accurate estimates based on real-world data (~8.5s per stream average with 20% buffer)
+- **Enhanced CSV Exports:** Now includes error_type field and rounded framerate values
+- **Better Progress Tracking:** Processing continues independently of browser connection
+
 ## Features
 
 - **Stream Status Checking:** Verify if IPTV streams are alive or dead with smart retry logic
+- **Background Processing:** Stream checks run in background threads to prevent browser timeouts
 - **Technical Analysis:** Extract resolution, framerate, and video format information
 - **Dispatcharr Integration:** Direct API communication with automatic authentication
 - **Channel Management:** Automated renaming and moving of channels based on analysis results
 - **Group-Based Operations:** Work with existing Dispatcharr channel groups
-- **Real-Time Progress Tracking:** Live ETA calculations with persistent progress state
-- **Parallel Processing:** Optional multi-threaded checking for faster results
-- **Enhanced CSV Exports:** Detailed statistics and plugin settings in export headers
-- **Cancellable Operations:** Stop long-running checks while preserving partial results
+- **Real-Time Progress Tracking:** Live ETA calculations based on actual processing speed
+- **Smart Retry System:** Timeout streams queued and retried after other streams for better success rates
+- **Enhanced Error Categorization:** Detailed error types (Timeout, 404, 403, Connection Refused, etc.)
+- **Enhanced CSV Exports:** Includes error types and rounded framerate values
+- **Server-Friendly Processing:** 3-second delays between checks for stability
 
 ## Requirements
 
@@ -85,14 +100,14 @@ docker exec dispatcharr which ffmpeg
 4. **Check Streams**
    - Click **Run** on **▶️ Start Stream Check**
    - Processing runs in the background to prevent browser timeouts
-   - Race condition protection prevents duplicate checks
-   - Stream checking includes delays between checks for server stability
+   - Returns immediately with estimated completion time
+   - Stream checking includes 3-second delays between checks for server stability
 
 5. **Monitor Progress**
-   - Click **📊 View Check Progress** for real-time status with ETA
+   - Click **📋 View Last Results** for real-time status with ETA
    - Shows format: "Checking streams X/Y - Z% complete | ETA: N min"
-   - Progress persists across page refreshes and server restarts
-   - Use **🛑 Cancel Stream Check** to stop if needed (partial results saved)
+   - ETA calculated dynamically based on actual processing speed
+   - Progress updates continue even if browser times out
 
 6. **View Results**
    - Click **📋 View Last Results** for summary when complete
@@ -120,10 +135,8 @@ docker exec dispatcharr which ffmpeg
 
 ### Core Stream Checking
 - **📥 Load Group(s):** Load channels from specified groups
-- **▶️ Start Stream Check:** Begin checking all loaded streams (with duplicate prevention)
-- **📊 View Check Progress:** View real-time progress with ETA
-- **🛑 Cancel Stream Check:** Stop the current check (preserves partial results)
-- **📋 View Last Results:** Summary of completed check
+- **▶️ Start Stream Check:** Begin checking all loaded streams in background thread
+- **📋 View Last Results:** View real-time progress with ETA or summary of completed check
 
 ### Channel Management
 - **✏️ Rename Dead Channels:** Apply rename format to dead streams
@@ -164,8 +177,8 @@ docker exec dispatcharr which ffmpeg
 - **Resolution:** Video resolution (e.g., 1920x1080)
 - **Format:** Detected format (4K/FHD/HD/SD)
 - **Framerate:** Frames per second (rounded to 1 decimal)
-- **Error Type:** Categorized failure reason for dead streams
-- **Error Details:** Specific failure reasons for dead streams
+- **Error Type:** Categorized failure reason (Timeout, 404 Not Found, 403 Forbidden, 500 Server Error, Connection Refused, Network Unreachable, Invalid Stream, Unsupported Protocol, Stream Unreachable, No Video Stream, Other)
+- **Error Details:** Specific failure messages for dead streams
 
 ### Quality Detection Rules
 - **Low Framerate:** Streams with <30fps
@@ -193,35 +206,30 @@ Each exported CSV includes comprehensive header comments:
 
 ## Advanced Features
 
-### Persistent Progress Tracking
-- Progress state saved to disk and survives server restarts
-- Multiple plugin instances share the same progress state
-- View progress from any browser or after page refresh
-- Cancel functionality preserves all partial results
+### Background Processing
+- Stream checks run in background threads to prevent browser/request timeouts
+- Returns immediately with estimated completion time
+- Processing continues even if browser connection is lost
+- Check progress anytime using "View Last Results"
 
 ### Smart Retry System
-- Timeout streams get retried after processing other streams (not immediately)
+- Timeout streams queued and retried after processing other streams (not immediately)
 - Provides server recovery time between retry attempts
 - Improves success rates for intermittent connection issues
-- Retry queue processes every 4 streams in sequential mode
+- Retry queue processes every 4 streams to balance throughput and recovery time
+- Multiple retry attempts per stream based on configured retry count
 
-### Parallel Processing Mode
-- Enable for significantly faster checking of large channel lists
-- Configurable worker count (default: 2)
-- Automatically handles retries for timed-out streams
-- Ideal for checking 50+ streams
-- Sequential mode still available for maximum reliability
-
-### Race Condition Prevention
-- Threading lock prevents duplicate checks from simultaneous button clicks
-- Helpful error message if check already running
-- Status displayed shows current progress percentage
+### Real-Time ETA Calculation
+- ETA calculated dynamically based on actual processing speed
+- Updates in real-time as streams are checked
+- More accurate than static time estimates
+- Accounts for network conditions and stream response times
 
 ### Performance Optimizations
-- **Sequential Mode:** 3-second delays between checks for server stability
-- **Parallel Mode:** Multiple streams checked simultaneously with overhead compensation
-- **Accurate Time Estimates:** Based on real-world performance data (~8.5s per stream)
-- **Server-Friendly Processing:** Reduces load on IPTV providers
+- **3-Second Delays:** Added between stream checks for server stability and reliability
+- **Accurate Time Estimates:** Based on real-world performance data (~8.5s per stream average)
+- **Server-Friendly Processing:** Delays reduce load on IPTV providers
+- **Background Threading:** Prevents browser timeouts during long-running checks
 
 ## Troubleshooting
 
@@ -264,11 +272,11 @@ docker restart dispatcharr
 - Restart container: `docker restart dispatcharr`
 
 **Progress Stuck or Not Updating:**
-- Progress now persists - use **📊 View Check Progress** for current status
-- Stream checking continues in the background even if browser shows timeout
+- Stream checking runs in background thread and continues even if browser times out
+- Use **📋 View Last Results** to check current status with real-time ETA
+- Processing continues independently of browser connection
 - Check container logs for actual processing status
-- Use **🛑 Cancel Stream Check** if truly stuck
-- Restart container: `docker restart dispatcharr`
+- Restart container if truly stuck: `docker restart dispatcharr`
 
 ### Debugging Commands
 
@@ -300,34 +308,29 @@ docker logs dispatcharr | tail -20
 ## Performance Notes
 
 ### Time Estimates
-**Sequential Mode:**
-- Based on ~8.5 seconds per stream average
-- Includes 20% buffer for reliability
-- Real-time ETA updates during processing based on actual speed
+- Based on ~8.5 seconds per stream average with 20% buffer for reliability
+- Real-time ETA calculated dynamically based on actual processing speed
+- ETA updates as streams are checked to provide accurate completion time
+- Accounts for network conditions and individual stream response times
 
-**Parallel Mode:**
-- Divides processing time by number of workers
-- Includes 10% overhead for coordination
-- Significantly faster for large channel lists
-- Example: 100 streams with 2 workers ≈ 8 minutes (vs 17 minutes sequential)
-
-### Processing Speed Comparison
-- **Sequential:** Safest, most reliable, 3-second delays between checks
-- **Parallel:** Faster, configurable workers, ideal for 50+ streams
-- **Smart Retries:** Both modes retry timeouts after other streams processed
+### Processing Behavior
+- **Background Processing:** Runs in separate thread to prevent browser timeouts
+- **Server-Friendly:** 3-second delays between stream checks for stability
+- **Smart Retries:** Timeout streams retried after processing other streams
+- **Retry Interval:** Retry queue processes every 4 streams for optimal recovery time
 
 ### Recommendations
-- **Small lists (<50 streams):** Sequential mode is fine
-- **Large lists (50+ streams):** Enable parallel mode for time savings
-- **Unstable sources:** Sequential mode with higher retry count
-- **Fast, reliable sources:** Parallel mode with 3-5 workers
+- Increase timeout setting for slow or unstable streams
+- Adjust retry count based on connection reliability
+- Monitor progress with "View Last Results" for real-time ETA
+- Allow background processing to complete even if browser times out
 
 ## Limitations
 
 - Requires valid Dispatcharr authentication
 - Limited to ffprobe-supported stream formats
 - Channel management operations are permanent (backup recommended)
-- Parallel mode uses more system resources than sequential mode
+- Background processing requires sufficient system resources
 
 ## Contributing
 
@@ -335,6 +338,6 @@ This plugin integrates deeply with Dispatcharr's API and channel management syst
 1. Include Dispatcharr version information
 2. Provide relevant container logs
 3. Test with small channel groups first
-4. Document specific API error messages
-5. Note if **📊 View Check Progress** shows different information than browser display
-6. Check `/data/iptv_checker_progress.json` for progress state
+4. Document specific API error messages and error types
+5. Note current progress from **📋 View Last Results** including ETA information
+6. Check `/data/iptv_checker_results.json` for completed results
