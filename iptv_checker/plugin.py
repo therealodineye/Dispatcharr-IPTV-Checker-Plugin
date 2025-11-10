@@ -211,7 +211,8 @@ class Plugin:
     def __init__(self):
         self.results_file = "/data/iptv_checker_results.json"
         self.loaded_channels_file = "/data/iptv_checker_loaded_channels.json"
-        self.check_progress = {"current": 0, "total": 0, "status": "idle", "start_time": None}
+        self.progress_file = "/data/iptv_checker_progress.json"
+        self.check_progress = self._load_progress()
         self.check_lock = threading.Lock()  # Lock to prevent duplicate checks
         self.status_thread = None
         self.stop_status_updates = False
@@ -222,6 +223,24 @@ class Plugin:
         self.token_cache_time = None  # Time when token was cached
         self.token_cache_duration = 3600  # Cache token for 1 hour (3600 seconds)
         LOGGER.info(f"{self.name} Plugin v{self.version} initialized")
+
+    def _load_progress(self):
+        """Load check progress from persistent storage"""
+        if os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                LOGGER.warning(f"Failed to load progress file: {e}")
+        return {"current": 0, "total": 0, "status": "idle", "start_time": None}
+
+    def _save_progress(self):
+        """Save check progress to persistent storage"""
+        try:
+            with open(self.progress_file, 'w') as f:
+                json.dump(self.check_progress, f)
+        except Exception as e:
+            LOGGER.error(f"Failed to save progress file: {e}")
 
     def run(self, action, params, context):
         """Main plugin entry point"""
@@ -260,6 +279,7 @@ class Plugin:
                 
         except Exception as e:
             self.check_progress['status'] = 'idle'
+            self._save_progress()
             self._stop_status_updates()
             LOGGER.error(f"Error in plugin run: {str(e)}")
             return {"status": "error", "message": str(e)}
@@ -464,6 +484,7 @@ class Plugin:
 
         # Reset status to idle
         self.check_progress['status'] = 'idle'
+        self._save_progress()
 
         logger.info(f"Stream check cancelled by user. Processed {current}/{total} streams before cancellation.")
 
@@ -667,6 +688,7 @@ class Plugin:
 
             # Set status to running atomically within the lock
             self.check_progress = {"current": 0, "total": len(all_streams), "status": "running", "start_time": time.time()}
+            self._save_progress()
             logger.info(f"Starting check for {len(all_streams)} streams...")
 
             # Start background status updates
@@ -720,6 +742,7 @@ class Plugin:
                     break
 
                 self.check_progress["current"] = i + 1
+                self._save_progress()
 
                 # Check stream - NO immediate retries, we'll handle them in the background queue
                 result = self.check_stream(stream_data, timeout, 0, logger, skip_retries=True)
@@ -779,6 +802,7 @@ class Plugin:
             logger.error(f"Background stream processing error: {e}")
         finally:
             self.check_progress['status'] = 'idle'
+            self._save_progress()
             self._stop_status_updates()
 
             # Set completion message
@@ -824,6 +848,7 @@ class Plugin:
                         with results_lock:
                             results_dict[index] = {**stream_data, **result}
                             self.check_progress["current"] = len(results_dict)
+                            self._save_progress()
 
                     except Exception as e:
                         logger.error(f"Error checking stream '{stream_data.get('channel_name')}': {e}")
@@ -837,6 +862,7 @@ class Plugin:
                                 'framerate_num': 0
                             }
                             self.check_progress["current"] = len(results_dict)
+                            self._save_progress()
 
             # Rebuild results list in original order
             results = [results_dict[i] for i in range(len(all_streams)) if i in results_dict]
@@ -883,6 +909,7 @@ class Plugin:
             logger.error(f"Background parallel stream processing error: {e}")
         finally:
             self.check_progress['status'] = 'idle'
+            self._save_progress()
             self._stop_status_updates()
 
             # Set completion message
@@ -1336,12 +1363,15 @@ class Plugin:
         default_return['error_type'] = last_error_type
         return default_return
 
-# Export for Dispatcharr plugin system - Multiple export formats for compatibility
-plugin = Plugin()
-plugin_instance = Plugin()
+# Export for Dispatcharr plugin system - Single shared instance to maintain state
+_plugin_instance = Plugin()
+
+# Export the same instance with different names for compatibility
+plugin = _plugin_instance
+plugin_instance = _plugin_instance
+iptv_checker = _plugin_instance
+IPTV_CHECKER = _plugin_instance
+
+# Export class-level attributes
 fields = Plugin.fields
 actions = Plugin.actions
-
-# Additional exports in case Dispatcharr looks for these specific names
-iptv_checker = Plugin()
-IPTV_CHECKER = Plugin()
