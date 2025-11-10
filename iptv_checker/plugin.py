@@ -1467,45 +1467,47 @@ class Plugin:
                     else:
                         last_error = 'No video stream found'
                         last_error_type = 'No Video Stream'
-                else: 
+                else:
                     error_output = result.stderr.strip() or 'Stream not accessible'
                     last_error = error_output
-                    
+
+                    # Log the actual error for debugging
+                    logger.debug(f"Stream '{channel_name}' failed with return code {result.returncode}")
+                    logger.debug(f"FFprobe stderr: {error_output[:200]}")  # First 200 chars
+
                     # Categorize the error type based on common ffprobe error patterns
                     error_lower = error_output.lower()
                     if 'timed out' in error_lower or 'timeout' in error_lower or 'connection timeout' in error_lower:
                         last_error_type = 'Timeout'
-                        last_error = 'Connection timeout'
+                        # Keep original error message for debugging
                     elif '404' in error_output or 'not found' in error_lower or 'no such file' in error_lower:
                         last_error_type = '404 Not Found'
-                        last_error = '404 Not Found'
+                        # Keep original error message for debugging
                     elif '403' in error_output or 'forbidden' in error_lower:
-                        last_error_type = '403 Forbidden' 
-                        last_error = '403 Forbidden'
+                        last_error_type = '403 Forbidden'
+                        # Keep original error message
                     elif '500' in error_output or 'internal server error' in error_lower:
                         last_error_type = 'Server Error'
-                        last_error = '500 Server Error'
+                        # Keep original error message
                     elif 'connection refused' in error_lower:
                         last_error_type = 'Connection Refused'
-                        last_error = 'Connection refused'
+                        # Keep original error message
                     elif 'network unreachable' in error_lower or 'no route to host' in error_lower:
                         last_error_type = 'Network Unreachable'
-                        last_error = 'Network unreachable'
+                        # Keep original error message
                     elif 'invalid data found' in error_lower or 'invalid argument' in error_lower:
                         last_error_type = 'Invalid Stream'
-                        last_error = 'Invalid stream format'
+                        # Keep original error message
                     elif 'protocol not supported' in error_lower:
                         last_error_type = 'Unsupported Protocol'
-                        last_error = 'Unsupported protocol'
+                        # Keep original error message
                     elif result.returncode == 1:
                         # Common ffprobe return code for unreachable streams
                         last_error_type = 'Stream Unreachable'
-                        last_error = 'Stream unreachable'
+                        # Keep original error message
                     else:
                         last_error_type = 'Other'
-                        # Keep original error but make it cleaner
-                        if 'stream not accessible' in error_lower:
-                            last_error = 'Stream not accessible'
+                        # Keep original error message
                         
             except subprocess.TimeoutExpired: 
                 last_error = 'Connection timeout'
