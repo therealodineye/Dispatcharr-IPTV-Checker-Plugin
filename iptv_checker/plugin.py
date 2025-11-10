@@ -117,7 +117,7 @@ class Plugin:
             "id": "enable_parallel_checking",
             "label": "⚡ Enable Parallel Stream Checking",
             "type": "boolean",
-            "default": False,
+            "default": True,
             "help_text": "Check multiple streams simultaneously for significantly faster processing. Recommended for large channel lists.",
         },
         {
@@ -126,6 +126,21 @@ class Plugin:
             "type": "number",
             "default": 2,
             "help_text": "Number of streams to check simultaneously when parallel checking is enabled. Default: 2. Higher values = faster but more resource-intensive.",
+        },
+        {
+            "id": "ffprobe_flags",
+            "label": "🔍 FFprobe Analysis Flags",
+            "type": "string",
+            "default": "-show_streams",
+            "placeholder": "-show_streams, -show_frames, -show_packets",
+            "help_text": "Comma-separated ffprobe flags for stream analysis. Options: -show_streams (basic validation), -show_frames (GOP/timestamps), -show_packets (bitrate), -loglevel error (errors only). Default: -show_streams",
+        },
+        {
+            "id": "ffprobe_analysis_duration",
+            "label": "⏱️ FFprobe Analysis Duration (seconds)",
+            "type": "number",
+            "default": 5,
+            "help_text": "Duration to analyze stream when using -show_frames or -show_packets. Longer duration = more accurate bitrate/GOP analysis but slower checks. Default: 5 seconds",
         }
     ]
     
@@ -432,6 +447,16 @@ class Plugin:
             has_errors = True
         else:
             validation_results.append(f"✅ Parallel Workers: {parallel_workers}")
+
+        ffprobe_flags = settings.get("ffprobe_flags", "-show_streams")
+        validation_results.append(f"✅ FFprobe Flags: {ffprobe_flags}")
+
+        analysis_duration = settings.get("ffprobe_analysis_duration", 5)
+        if analysis_duration <= 0:
+            validation_results.append(f"⚠️ FFprobe Analysis Duration should be greater than 0 (current: {analysis_duration})")
+            has_errors = True
+        else:
+            validation_results.append(f"✅ FFprobe Analysis Duration: {analysis_duration} seconds")
 
         # Return results
         status = "error" if has_errors else "success"
@@ -745,7 +770,7 @@ class Plugin:
                 self._save_progress()
 
                 # Check stream - NO immediate retries, we'll handle them in the background queue
-                result = self.check_stream(stream_data, timeout, 0, logger, skip_retries=True)
+                result = self.check_stream(stream_data, timeout, 0, logger, skip_retries=True, settings=settings)
 
                 # If stream timed out and we have retries enabled, add to retry queue
                 if result.get('error_type') == 'Timeout' and retries > 0:
@@ -762,7 +787,7 @@ class Plugin:
 
                     if retry_stream["retry_count"] <= retries:
                         logger.info(f"Retrying timeout stream: '{retry_stream.get('channel_name')}' (attempt {retry_stream['retry_count']}/{retries})")
-                        retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True)  # No immediate retries
+                        retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True, settings=settings)  # No immediate retries
 
                         # Update the original result in the results list
                         for j, existing_result in enumerate(results):
@@ -786,7 +811,7 @@ class Plugin:
                 if retry_stream["retry_count"] < retries:
                     retry_stream["retry_count"] += 1
                     logger.info(f"Final retry for timeout stream: '{retry_stream.get('channel_name')}' (attempt {retry_stream['retry_count']}/{retries})")
-                    retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True)
+                    retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True, settings=settings)
 
                     # Update the original result in the results list
                     for j, existing_result in enumerate(results):
@@ -830,7 +855,7 @@ class Plugin:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 # Submit all stream checks
                 future_to_index = {
-                    executor.submit(self.check_stream, stream_data, timeout, 0, logger, skip_retries=True): i
+                    executor.submit(self.check_stream, stream_data, timeout, 0, logger, skip_retries=True, settings=settings): i
                     for i, stream_data in enumerate(all_streams)
                 }
 
@@ -860,7 +885,8 @@ class Plugin:
                                 'error': str(e),
                                 'error_type': 'Other',
                                 'format': 'N/A',
-                                'framerate_num': 0
+                                'framerate_num': 0,
+                                'ffprobe_data': {}
                             }
                             self.check_progress["current"] = len(results_dict)
                             self._save_progress()
@@ -886,7 +912,7 @@ class Plugin:
                                 executor.submit(
                                     self.check_stream,
                                     {k: v for k, v in result.items() if k in ['channel_id', 'channel_name', 'stream_url', 'stream_id']},
-                                    timeout, 0, logger, skip_retries=True
+                                    timeout, 0, logger, skip_retries=True, settings=settings
                                 ): result_index
                                 for result_index, result in timeout_streams
                             }
@@ -1158,6 +1184,8 @@ class Plugin:
         lines.append(f"#   Video Format Suffixes: {settings.get('video_format_suffixes', '4k, FHD, HD, SD, Unknown')}")
         lines.append(f"#   Parallel Checking Enabled: {settings.get('enable_parallel_checking', False)}")
         lines.append(f"#   Parallel Workers: {settings.get('parallel_workers', 2)}")
+        lines.append(f"#   FFprobe Flags: {settings.get('ffprobe_flags', '-show_streams')}")
+        lines.append(f"#   FFprobe Analysis Duration: {settings.get('ffprobe_analysis_duration', 5)} seconds")
         lines.append("#")
 
         # Calculate cumulative statistics
@@ -1223,10 +1251,27 @@ class Plugin:
         if not os.path.exists(self.results_file): return {"status": "error", "message": "No results to export."}
         with open(self.results_file, 'r') as f: results = json.load(f)
 
-        # Round framerate to whole number for cleaner CSV
+        # Flatten ffprobe_data and round framerate for cleaner CSV
         for result in results:
             if 'framerate_num' in result and result['framerate_num'] > 0:
                 result['framerate_num'] = round(result['framerate_num'])
+
+            # Flatten ffprobe_data into top-level fields
+            if 'ffprobe_data' in result and isinstance(result['ffprobe_data'], dict):
+                ffprobe_data = result.pop('ffprobe_data')
+                for key, value in ffprobe_data.items():
+                    result[f'ffprobe_{key}'] = value
+
+        # Determine all possible fieldnames including dynamic ffprobe fields
+        base_fieldnames = ['channel_id', 'channel_name', 'stream_id', 'status', 'format', 'framerate_num', 'error_type', 'error']
+        ffprobe_fieldnames = set()
+        for result in results:
+            for key in result.keys():
+                if key.startswith('ffprobe_'):
+                    ffprobe_fieldnames.add(key)
+
+        # Create complete fieldnames list
+        fieldnames = base_fieldnames + sorted(list(ffprobe_fieldnames))
 
         filepath = f"/data/exports/iptv_checker_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         os.makedirs("/data/exports", exist_ok=True)
@@ -1237,7 +1282,7 @@ class Plugin:
                 f.write(comment_line + '\n')
 
             # Write CSV data
-            writer = csv.DictWriter(f, fieldnames=['channel_id', 'channel_name', 'stream_id', 'status', 'format', 'framerate_num', 'error_type', 'error'], extrasaction='ignore')
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(results)
         return {"status": "success", "message": f"Results exported to {filepath}"}
@@ -1306,20 +1351,58 @@ class Plugin:
             return float(framerate_str)
         except (ValueError, ZeroDivisionError): return 0
 
-    def check_stream(self, stream_data, timeout, retries, logger, skip_retries=False):
+    def check_stream(self, stream_data, timeout, retries, logger, skip_retries=False, settings=None):
         """Check individual stream status with optional retries."""
         url, channel_name = stream_data.get('stream_url'), stream_data.get('channel_name')
         last_error = "Unknown error"
         last_error_type = "Other"
-        default_return = {'status': 'Dead', 'error': '', 'error_type': 'Other', 'format': 'N/A', 'framerate_num': 0}
+        default_return = {'status': 'Dead', 'error': '', 'error_type': 'Other', 'format': 'N/A', 'framerate_num': 0, 'ffprobe_data': {}}
 
         # Determine how many attempts to make
         max_attempts = 1 if skip_retries else (retries + 1)
 
+        # Parse ffprobe flags from settings
+        ffprobe_flags_str = settings.get('ffprobe_flags', '-show_streams') if settings else '-show_streams'
+        ffprobe_flags = [flag.strip() for flag in ffprobe_flags_str.split(',') if flag.strip()]
+
+        # Build base command
+        cmd = ['/usr/local/bin/ffprobe', '-print_format', 'json', '-user_agent', 'IPTVChecker 1.0', '-timeout', str(timeout * 1000000)]
+
+        # Add loglevel flag if specified, otherwise use default quiet mode
+        has_loglevel = any('loglevel' in flag for flag in ffprobe_flags)
+        if has_loglevel:
+            # Add loglevel flags from user config
+            for flag in ffprobe_flags:
+                if 'loglevel' in flag:
+                    cmd.extend(flag.split())
+        else:
+            cmd.extend(['-v', 'quiet'])
+
+        # Add show flags (streams, frames, packets)
+        for flag in ffprobe_flags:
+            if flag.startswith('-show_'):
+                cmd.append(flag)
+
+        # Ensure -show_streams is always included for basic validation
+        if '-show_streams' not in cmd:
+            cmd.append('-show_streams')
+
+        # If using frame or packet analysis, add duration limit
+        analysis_duration = 0
+        if any(flag in cmd for flag in ['-show_frames', '-show_packets']):
+            analysis_duration = settings.get('ffprobe_analysis_duration', 5) if settings else 5
+            cmd.extend(['-t', str(analysis_duration)])
+            logger.debug(f"Added analysis duration: {analysis_duration} seconds for frame/packet analysis")
+
+        # Add URL at the end
+        cmd.append(url)
+
+        # Calculate total timeout: connection timeout + analysis duration + 2 second buffer
+        total_timeout = timeout + analysis_duration + 2
+
         for attempt in range(max_attempts):
             try:
-                cmd = ['/usr/local/bin/ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-user_agent', 'IPTVChecker 1.0', '-timeout', str(timeout * 1000000), url]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=total_timeout)
                 
                 if result.returncode == 0:
                     probe_data = json.loads(result.stdout)
@@ -1327,8 +1410,41 @@ class Plugin:
                     if video_stream:
                         resolution = f"{video_stream.get('width', 0)}x{video_stream.get('height', 0)}"
                         framerate_num = self.parse_framerate(video_stream.get('r_frame_rate', '0/1'))
-                        return {'status': 'Alive', 'error': '', 'error_type': 'N/A', 'format': self._get_stream_format(resolution), 'framerate_num': framerate_num}
-                    else: 
+
+                        # Collect additional ffprobe data
+                        ffprobe_extra_data = {}
+
+                        # Add frame data if available
+                        if probe_data.get('frames'):
+                            frames = probe_data['frames']
+                            ffprobe_extra_data['frame_count'] = len(frames)
+                            ffprobe_extra_data['first_frame_pts'] = frames[0].get('pts', 'N/A') if frames else 'N/A'
+
+                        # Add packet data if available
+                        if probe_data.get('packets'):
+                            packets = probe_data['packets']
+                            ffprobe_extra_data['packet_count'] = len(packets)
+                            # Calculate average bitrate from packets
+                            total_size = sum(int(p.get('size', 0)) for p in packets)
+                            total_duration = sum(float(p.get('duration_time', 0)) for p in packets)
+                            if total_duration > 0:
+                                avg_bitrate_kbps = (total_size * 8) / (total_duration * 1000)
+                                ffprobe_extra_data['avg_bitrate_kbps'] = round(avg_bitrate_kbps, 2)
+
+                        # Add codec info from streams
+                        if video_stream:
+                            ffprobe_extra_data['codec'] = video_stream.get('codec_name', 'N/A')
+                            ffprobe_extra_data['bitrate'] = video_stream.get('bit_rate', 'N/A')
+
+                        return {
+                            'status': 'Alive',
+                            'error': '',
+                            'error_type': 'N/A',
+                            'format': self._get_stream_format(resolution),
+                            'framerate_num': framerate_num,
+                            'ffprobe_data': ffprobe_extra_data
+                        }
+                    else:
                         last_error = 'No video stream found'
                         last_error_type = 'No Video Stream'
                 else: 
