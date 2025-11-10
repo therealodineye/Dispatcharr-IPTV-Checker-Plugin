@@ -189,7 +189,7 @@ Each exported CSV includes comprehensive header comments:
 - **Results:** `/data/iptv_checker_results.json`
 - **Loaded Channels:** `/data/iptv_checker_loaded_channels.json`
 - **Progress State:** `/data/iptv_checker_progress.json` *(persists across restarts)*
-- **CSV Exports:** `/data/exports/iptv_check_results_YYYYMMDD_HHMMSS.csv`
+- **CSV Exports:** `/data/exports/iptv_checker_results_YYYYMMDD_HHMMSS.csv`
 
 ## Advanced Features
 

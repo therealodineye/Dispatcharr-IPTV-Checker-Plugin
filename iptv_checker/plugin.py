@@ -15,11 +15,11 @@ import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Setup logging using Dispatcharr's format
+# Setup logging using Dispatcharr's format with plugin name prefix
 LOGGER = logging.getLogger("plugins.iptv_checker")
 if not LOGGER.handlers:
     handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(levelname)s %(name)s %(message)s")
+    formatter = logging.Formatter("[IPTV Checker] %(levelname)s %(message)s")
     handler.setFormatter(formatter)
     LOGGER.addHandler(handler)
 LOGGER.setLevel(logging.INFO)
@@ -222,7 +222,7 @@ class Plugin:
         self.cached_token = None  # Cached API token
         self.token_cache_time = None  # Time when token was cached
         self.token_cache_duration = 3600  # Cache token for 1 hour (3600 seconds)
-        LOGGER.info(f"{self.name} Plugin v{self.version} initialized")
+        LOGGER.info(f"Plugin v{self.version} initialized")
 
     def _load_progress(self):
         """Load check progress from persistent storage"""
@@ -244,7 +244,7 @@ class Plugin:
 
     def run(self, action, params, context):
         """Main plugin entry point"""
-        LOGGER.info(f"IPTV Checker run called with action: {action}")
+        LOGGER.info(f"Run called with action: {action}")
         LOGGER.info(f"Plugin key from context: {context.get('plugin_key', 'unknown')}")  # Debug line
         
         try:
@@ -1204,7 +1204,7 @@ class Plugin:
             if 'framerate_num' in result and result['framerate_num'] > 0:
                 result['framerate_num'] = round(result['framerate_num'], 1)
 
-        filepath = f"/data/exports/iptv_check_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filepath = f"/data/exports/iptv_checker_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         os.makedirs("/data/exports", exist_ok=True)
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             # Write header comments
@@ -1226,7 +1226,7 @@ class Plugin:
             return {"status": "info", "message": "No exports directory found. No CSV files to delete."}
 
         # Find all CSV files that match our naming pattern
-        csv_files = [f for f in os.listdir(exports_dir) if f.startswith('iptv_check_results_') and f.endswith('.csv')]
+        csv_files = [f for f in os.listdir(exports_dir) if f.startswith('iptv_checker_results_') and f.endswith('.csv')]
 
         if not csv_files:
             return {"status": "info", "message": "No CSV export files found in /data/exports/."}
