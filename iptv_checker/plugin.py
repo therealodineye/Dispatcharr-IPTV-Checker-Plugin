@@ -15,14 +15,17 @@ import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Setup logging using Dispatcharr's format with plugin name prefix
+# Setup logging with plugin name for Dispatcharr's logging system
+class PluginNameFilter(logging.Filter):
+    """Filter that adds [IPTV Checker] prefix to all log messages"""
+    def filter(self, record):
+        if not record.getMessage().startswith('[IPTV Checker]'):
+            record.msg = f'[IPTV Checker] {record.msg}'
+        return True
+
 LOGGER = logging.getLogger("plugins.iptv_checker")
-if not LOGGER.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("[IPTV Checker] %(levelname)s %(message)s")
-    handler.setFormatter(formatter)
-    LOGGER.addHandler(handler)
 LOGGER.setLevel(logging.INFO)
+LOGGER.addFilter(PluginNameFilter())
 
 class Plugin:
     """Dispatcharr IPTV Checker Plugin"""
@@ -261,10 +264,14 @@ class Plugin:
         """Main plugin entry point"""
         LOGGER.info(f"Run called with action: {action}")
         LOGGER.info(f"Plugin key from context: {context.get('plugin_key', 'unknown')}")  # Debug line
-        
+
         try:
             settings = context.get("settings", {})
             logger = context.get("logger", LOGGER)
+
+            # Add our filter to context logger to ensure all logs are prefixed
+            if logger is not LOGGER and not any(isinstance(f, PluginNameFilter) for f in logger.filters):
+                logger.addFilter(PluginNameFilter())
             
             action_map = {
                 "validate_settings": self.validate_settings_action,
