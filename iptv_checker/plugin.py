@@ -802,6 +802,7 @@ class Plugin:
             logger.error(f"Background stream processing error: {e}")
         finally:
             self.check_progress['status'] = 'idle'
+            self.check_progress['end_time'] = time.time()
             self._save_progress()
             self._stop_status_updates()
 
@@ -909,6 +910,7 @@ class Plugin:
             logger.error(f"Background parallel stream processing error: {e}")
         finally:
             self.check_progress['status'] = 'idle'
+            self.check_progress['end_time'] = time.time()
             self._save_progress()
             self._stop_status_updates()
 
@@ -1122,6 +1124,28 @@ class Plugin:
         lines.append(f"# Plugin Version: {self.version}")
         lines.append("#")
 
+        # Add timing information
+        if self.check_progress.get('start_time') and self.check_progress.get('end_time'):
+            start_time = self.check_progress['start_time']
+            end_time = self.check_progress['end_time']
+            start_str = datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+            end_str = datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+            duration_seconds = end_time - start_time
+            hours = int(duration_seconds // 3600)
+            minutes = int((duration_seconds % 3600) // 60)
+            seconds = int(duration_seconds % 60)
+
+            lines.append("# Check Timing:")
+            lines.append(f"#   Start Time: {start_str}")
+            lines.append(f"#   End Time: {end_str}")
+            if hours > 0:
+                lines.append(f"#   Duration: {hours}h {minutes}m {seconds}s")
+            elif minutes > 0:
+                lines.append(f"#   Duration: {minutes}m {seconds}s")
+            else:
+                lines.append(f"#   Duration: {seconds}s")
+            lines.append("#")
+
         # Add plugin settings (excluding sensitive information)
         lines.append("# Plugin Settings:")
         lines.append(f"#   Group(s) Checked: {settings.get('group_names', 'All groups')}")
@@ -1199,10 +1223,10 @@ class Plugin:
         if not os.path.exists(self.results_file): return {"status": "error", "message": "No results to export."}
         with open(self.results_file, 'r') as f: results = json.load(f)
 
-        # Round framerate to 1 decimal place for cleaner CSV
+        # Round framerate to whole number for cleaner CSV
         for result in results:
             if 'framerate_num' in result and result['framerate_num'] > 0:
-                result['framerate_num'] = round(result['framerate_num'], 1)
+                result['framerate_num'] = round(result['framerate_num'])
 
         filepath = f"/data/exports/iptv_checker_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         os.makedirs("/data/exports", exist_ok=True)
@@ -1213,7 +1237,7 @@ class Plugin:
                 f.write(comment_line + '\n')
 
             # Write CSV data
-            writer = csv.DictWriter(f, fieldnames=['channel_name', 'stream_url', 'status', 'format', 'framerate_num', 'error_type', 'error'], extrasaction='ignore')
+            writer = csv.DictWriter(f, fieldnames=['channel_id', 'channel_name', 'stream_id', 'status', 'format', 'framerate_num', 'error_type', 'error'], extrasaction='ignore')
             writer.writeheader()
             writer.writerows(results)
         return {"status": "success", "message": f"Results exported to {filepath}"}
