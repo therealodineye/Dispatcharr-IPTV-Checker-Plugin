@@ -3,6 +3,11 @@
 **Description:** Check IPTV stream status, analyze stream quality, and manage channels based on results
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/PiratesIRC/Dispatcharr-IPTV-Checker-Plugin)
 
+## ⚠️ Important: Backup Your Database
+Before installing or using this plugin, it is **highly recommended** that you create a backup of your Dispatcharr database. This plugin makes significant changes to your channel and stream assignments.
+
+**[Click here for instructions on how to back up your database.](https://dispatcharr.github.io/Dispatcharr-Docs/troubleshooting/?h=backup#how-can-i-make-a-backup-of-the-database)**
+
 ## Features
 
 - **Stream Status Checking:** Verify if IPTV streams are alive or dead with smart retry logic
