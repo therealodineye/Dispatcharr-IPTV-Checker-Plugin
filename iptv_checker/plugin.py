@@ -15,14 +15,17 @@ import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Setup logging using Dispatcharr's format with plugin name prefix
+# Setup logging with plugin name for Dispatcharr's logging system
+class PluginNameFilter(logging.Filter):
+    """Filter that adds [IPTV Checker] prefix to all log messages"""
+    def filter(self, record):
+        if not record.getMessage().startswith('[IPTV Checker]'):
+            record.msg = f'[IPTV Checker] {record.msg}'
+        return True
+
 LOGGER = logging.getLogger("plugins.iptv_checker")
-if not LOGGER.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("[IPTV Checker] %(levelname)s %(message)s")
-    handler.setFormatter(formatter)
-    LOGGER.addHandler(handler)
 LOGGER.setLevel(logging.INFO)
+LOGGER.addFilter(PluginNameFilter())
 
 class Plugin:
     """Dispatcharr IPTV Checker Plugin"""
@@ -108,9 +111,9 @@ class Plugin:
         },
         {
             "id": "video_format_suffixes",
-            "label": "🎬 Add Video Format Suffixes - [4k], [FHD], [HD], [SD], [Unknown]",
+            "label": "🎬 Add Video Format Suffixes - [UHD], [FHD], [HD], [SD], [Unknown]",
             "type": "string",
-            "default": "4k, FHD, HD, SD, Unknown",
+            "default": "UHD, FHD, HD, SD, Unknown",
             "help_text": "A comma-separated list of formats to add as a suffix (e.g., [HD]) to channel names.",
         },
         {
@@ -261,10 +264,14 @@ class Plugin:
         """Main plugin entry point"""
         LOGGER.info(f"Run called with action: {action}")
         LOGGER.info(f"Plugin key from context: {context.get('plugin_key', 'unknown')}")  # Debug line
-        
+
         try:
             settings = context.get("settings", {})
             logger = context.get("logger", LOGGER)
+
+            # Add our filter to context logger to ensure all logs are prefixed
+            if logger is not LOGGER and not any(isinstance(f, PluginNameFilter) for f in logger.filters):
+                logger.addFilter(PluginNameFilter())
             
             action_map = {
                 "validate_settings": self.validate_settings_action,
@@ -770,7 +777,7 @@ class Plugin:
                 self._save_progress()
 
                 # Check stream - NO immediate retries, we'll handle them in the background queue
-                result = self.check_stream(stream_data, timeout, 0, logger, skip_retries=True, settings=settings)
+                result = self.check_stream(stream_data, timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=0)
 
                 # If stream timed out and we have retries enabled, add to retry queue
                 if result.get('error_type') == 'Timeout' and retries > 0:
@@ -787,7 +794,7 @@ class Plugin:
 
                     if retry_stream["retry_count"] <= retries:
                         logger.info(f"Retrying timeout stream: '{retry_stream.get('channel_name')}' (attempt {retry_stream['retry_count']}/{retries})")
-                        retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True, settings=settings)  # No immediate retries
+                        retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=retry_stream["retry_count"])  # No immediate retries
 
                         # Update the original result in the results list
                         for j, existing_result in enumerate(results):
@@ -811,7 +818,7 @@ class Plugin:
                 if retry_stream["retry_count"] < retries:
                     retry_stream["retry_count"] += 1
                     logger.info(f"Final retry for timeout stream: '{retry_stream.get('channel_name')}' (attempt {retry_stream['retry_count']}/{retries})")
-                    retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True, settings=settings)
+                    retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=retry_stream["retry_count"])
 
                     # Update the original result in the results list
                     for j, existing_result in enumerate(results):
@@ -855,7 +862,7 @@ class Plugin:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 # Submit all stream checks
                 future_to_index = {
-                    executor.submit(self.check_stream, stream_data, timeout, 0, logger, skip_retries=True, settings=settings): i
+                    executor.submit(self.check_stream, stream_data, timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=0): i
                     for i, stream_data in enumerate(all_streams)
                 }
 
@@ -901,18 +908,18 @@ class Plugin:
                 if timeout_streams:
                     logger.info(f"Found {len(timeout_streams)} timeout streams, retrying...")
 
-                    for retry_attempt in range(retries):
+                    for retry_pass in range(retries):
                         if not timeout_streams:
                             break
 
-                        logger.info(f"Retry attempt {retry_attempt + 1}/{retries} for {len(timeout_streams)} streams")
+                        logger.info(f"Retry attempt {retry_pass + 1}/{retries} for {len(timeout_streams)} streams")
 
                         with ThreadPoolExecutor(max_workers=workers) as executor:
                             future_to_result_index = {
                                 executor.submit(
                                     self.check_stream,
                                     {k: v for k, v in result.items() if k in ['channel_id', 'channel_name', 'stream_url', 'stream_id']},
-                                    timeout, 0, logger, skip_retries=True, settings=settings
+                                    timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=retry_pass + 1
                                 ): result_index
                                 for result_index, result in timeout_streams
                             }
@@ -1087,7 +1094,7 @@ class Plugin:
 
     def add_video_format_suffix_action(self, settings, logger):
         """Adds a format suffix like [HD] to channel names."""
-        suffixes_to_add_str = settings.get("video_format_suffixes", "4k, FHD, HD, SD, Unknown").strip().lower()
+        suffixes_to_add_str = settings.get("video_format_suffixes", "UHD, FHD, HD, SD, Unknown").strip().lower()
         if not suffixes_to_add_str:
             return {"status": "error", "message": "Please specify which video formats should have a suffix added."}
         
@@ -1181,7 +1188,7 @@ class Plugin:
         lines.append(f"#   Move Dead to Group: {settings.get('move_to_group_name', 'Graveyard')}")
         lines.append(f"#   Low Framerate Rename Format: {settings.get('low_framerate_rename_format', '{name} [Slow]')}")
         lines.append(f"#   Move Low Framerate to Group: {settings.get('move_low_framerate_group', 'Slow')}")
-        lines.append(f"#   Video Format Suffixes: {settings.get('video_format_suffixes', '4k, FHD, HD, SD, Unknown')}")
+        lines.append(f"#   Video Format Suffixes: {settings.get('video_format_suffixes', 'UHD, FHD, HD, SD, Unknown')}")
         lines.append(f"#   Parallel Checking Enabled: {settings.get('enable_parallel_checking', False)}")
         lines.append(f"#   Parallel Workers: {settings.get('parallel_workers', 2)}")
         lines.append(f"#   FFprobe Flags: {settings.get('ffprobe_flags', '-show_streams')}")
@@ -1263,7 +1270,7 @@ class Plugin:
                     result[f'ffprobe_{key}'] = value
 
         # Determine all possible fieldnames including dynamic ffprobe fields
-        base_fieldnames = ['channel_id', 'channel_name', 'stream_id', 'status', 'format', 'framerate_num', 'error_type', 'error']
+        base_fieldnames = ['channel_id', 'channel_name', 'stream_id', 'status', 'format', 'framerate_num', 'error_type', 'error', 'retry_count', 'timeout_seconds', 'ffprobe_monitoring_seconds']
         ffprobe_fieldnames = set()
         for result in results:
             for key in result.keys():
@@ -1335,7 +1342,7 @@ class Plugin:
         if 'x' not in resolution_str: return "Unknown"
         try:
             width = int(resolution_str.split('x')[0])
-            if width >= 3800: return "4K"
+            if width >= 3800: return "UHD"
             if width >= 1900: return "FHD"
             if width >= 1200: return "HD"
             if width > 0: return "SD"
@@ -1351,12 +1358,22 @@ class Plugin:
             return float(framerate_str)
         except (ValueError, ZeroDivisionError): return 0
 
-    def check_stream(self, stream_data, timeout, retries, logger, skip_retries=False, settings=None):
+    def check_stream(self, stream_data, timeout, retries, logger, skip_retries=False, settings=None, retry_attempt=0):
         """Check individual stream status with optional retries."""
         url, channel_name = stream_data.get('stream_url'), stream_data.get('channel_name')
         last_error = "Unknown error"
         last_error_type = "Other"
-        default_return = {'status': 'Dead', 'error': '', 'error_type': 'Other', 'format': 'N/A', 'framerate_num': 0, 'ffprobe_data': {}}
+        default_return = {
+            'status': 'Dead',
+            'error': '',
+            'error_type': 'Other',
+            'format': 'N/A',
+            'framerate_num': 0,
+            'ffprobe_data': {},
+            'retry_count': retry_attempt,
+            'timeout_seconds': timeout,
+            'ffprobe_monitoring_seconds': 0
+        }
 
         # Determine how many attempts to make
         max_attempts = 1 if skip_retries else (retries + 1)
@@ -1442,50 +1459,55 @@ class Plugin:
                             'error_type': 'N/A',
                             'format': self._get_stream_format(resolution),
                             'framerate_num': framerate_num,
-                            'ffprobe_data': ffprobe_extra_data
+                            'ffprobe_data': ffprobe_extra_data,
+                            'retry_count': retry_attempt,
+                            'timeout_seconds': timeout,
+                            'ffprobe_monitoring_seconds': analysis_duration
                         }
                     else:
                         last_error = 'No video stream found'
                         last_error_type = 'No Video Stream'
-                else: 
+                else:
                     error_output = result.stderr.strip() or 'Stream not accessible'
                     last_error = error_output
-                    
+
+                    # Log the actual error for debugging
+                    logger.debug(f"Stream '{channel_name}' failed with return code {result.returncode}")
+                    logger.debug(f"FFprobe stderr: {error_output[:200]}")  # First 200 chars
+
                     # Categorize the error type based on common ffprobe error patterns
                     error_lower = error_output.lower()
                     if 'timed out' in error_lower or 'timeout' in error_lower or 'connection timeout' in error_lower:
                         last_error_type = 'Timeout'
-                        last_error = 'Connection timeout'
+                        # Keep original error message for debugging
                     elif '404' in error_output or 'not found' in error_lower or 'no such file' in error_lower:
                         last_error_type = '404 Not Found'
-                        last_error = '404 Not Found'
+                        # Keep original error message for debugging
                     elif '403' in error_output or 'forbidden' in error_lower:
-                        last_error_type = '403 Forbidden' 
-                        last_error = '403 Forbidden'
+                        last_error_type = '403 Forbidden'
+                        # Keep original error message
                     elif '500' in error_output or 'internal server error' in error_lower:
                         last_error_type = 'Server Error'
-                        last_error = '500 Server Error'
+                        # Keep original error message
                     elif 'connection refused' in error_lower:
                         last_error_type = 'Connection Refused'
-                        last_error = 'Connection refused'
+                        # Keep original error message
                     elif 'network unreachable' in error_lower or 'no route to host' in error_lower:
                         last_error_type = 'Network Unreachable'
-                        last_error = 'Network unreachable'
+                        # Keep original error message
                     elif 'invalid data found' in error_lower or 'invalid argument' in error_lower:
                         last_error_type = 'Invalid Stream'
-                        last_error = 'Invalid stream format'
+                        # Keep original error message
                     elif 'protocol not supported' in error_lower:
                         last_error_type = 'Unsupported Protocol'
-                        last_error = 'Unsupported protocol'
+                        # Keep original error message
                     elif result.returncode == 1:
                         # Common ffprobe return code for unreachable streams
                         last_error_type = 'Stream Unreachable'
-                        last_error = 'Stream unreachable'
+                        # Keep original error message
                     else:
                         last_error_type = 'Other'
-                        # Keep original error but make it cleaner
-                        if 'stream not accessible' in error_lower:
-                            last_error = 'Stream not accessible'
+                        # Keep original error message
                         
             except subprocess.TimeoutExpired: 
                 last_error = 'Connection timeout'
