@@ -1047,19 +1047,105 @@ class Plugin:
             if count > 0: summary.append(f"• {fmt}: {count}")
         return {"status": "success", "message": "\n".join(summary)}
 
+    def _generate_csv_header_comments(self, settings, results):
+        """Generate CSV header comments with settings and statistics"""
+        lines = []
+        lines.append("# IPTV Checker Plugin - Export Results")
+        lines.append(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"# Plugin Version: {self.version}")
+        lines.append("#")
+
+        # Add plugin settings (excluding sensitive information)
+        lines.append("# Plugin Settings:")
+        lines.append(f"#   Group(s) Checked: {settings.get('group_names', 'All groups')}")
+        lines.append(f"#   Connection Timeout: {settings.get('timeout', 10)} seconds")
+        lines.append(f"#   Dead Connection Retries: {settings.get('dead_connection_retries', 3)}")
+        lines.append(f"#   Dead Rename Format: {settings.get('dead_rename_format', '{name} [DEAD]')}")
+        lines.append(f"#   Move Dead to Group: {settings.get('move_to_group_name', 'Graveyard')}")
+        lines.append(f"#   Low Framerate Rename Format: {settings.get('low_framerate_rename_format', '{name} [Slow]')}")
+        lines.append(f"#   Move Low Framerate to Group: {settings.get('move_low_framerate_group', 'Slow')}")
+        lines.append(f"#   Video Format Suffixes: {settings.get('video_format_suffixes', '4k, FHD, HD, SD, Unknown')}")
+        lines.append(f"#   Parallel Checking Enabled: {settings.get('enable_parallel_checking', False)}")
+        lines.append(f"#   Parallel Workers: {settings.get('parallel_workers', 2)}")
+        lines.append("#")
+
+        # Calculate cumulative statistics
+        total_streams = len(results)
+        alive_streams = sum(1 for r in results if r.get('status') == 'Alive')
+        dead_streams = total_streams - alive_streams
+
+        # Format distribution
+        format_counts = {}
+        for r in results:
+            if r.get('status') == 'Alive':
+                fmt = r.get('format', 'Unknown')
+                format_counts[fmt] = format_counts.get(fmt, 0) + 1
+
+        # Average framerate for alive streams
+        alive_framerates = [r.get('framerate_num', 0) for r in results if r.get('status') == 'Alive' and r.get('framerate_num', 0) > 0]
+        avg_framerate = sum(alive_framerates) / len(alive_framerates) if alive_framerates else 0
+
+        # Error type distribution
+        error_counts = {}
+        for r in results:
+            if r.get('status') == 'Dead':
+                error_type = r.get('error_type', 'Other')
+                error_counts[error_type] = error_counts.get(error_type, 0) + 1
+
+        # Add cumulative statistics
+        lines.append("# Cumulative Statistics:")
+        lines.append(f"#   Total Streams: {total_streams}")
+        lines.append(f"#   Alive Streams: {alive_streams} ({(alive_streams/total_streams*100):.1f}%)")
+        lines.append(f"#   Dead Streams: {dead_streams} ({(dead_streams/total_streams*100):.1f}%)")
+
+        if format_counts:
+            lines.append("#")
+            lines.append("#   Alive Stream Formats:")
+            for fmt in sorted(format_counts.keys()):
+                count = format_counts[fmt]
+                lines.append(f"#     {fmt}: {count} ({(count/alive_streams*100):.1f}%)")
+
+        if avg_framerate > 0:
+            lines.append("#")
+            lines.append(f"#   Average Framerate (Alive): {avg_framerate:.1f} fps")
+
+        # Low framerate streams
+        low_fps_count = sum(1 for r in results if r.get('status') == 'Alive' and 0 < r.get('framerate_num', 0) < 30)
+        if low_fps_count > 0:
+            lines.append(f"#   Low Framerate Streams (<30fps): {low_fps_count}")
+
+        if error_counts:
+            lines.append("#")
+            lines.append("#   Error Type Distribution:")
+            for error_type in sorted(error_counts.keys()):
+                count = error_counts[error_type]
+                lines.append(f"#     {error_type}: {count} ({(count/dead_streams*100):.1f}%)")
+
+        lines.append("#")
+        lines.append("# " + "="*80)
+        lines.append("#")
+
+        return lines
+
     def export_results_action(self, settings, logger):
         """Export results to CSV"""
         if not os.path.exists(self.results_file): return {"status": "error", "message": "No results to export."}
         with open(self.results_file, 'r') as f: results = json.load(f)
-        
+
         # Round framerate to 1 decimal place for cleaner CSV
         for result in results:
             if 'framerate_num' in result and result['framerate_num'] > 0:
                 result['framerate_num'] = round(result['framerate_num'], 1)
-        
+
         filepath = f"/data/exports/iptv_check_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         os.makedirs("/data/exports", exist_ok=True)
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            # Write header comments
+            header_comments = self._generate_csv_header_comments(settings, results)
+            for comment_line in header_comments:
+                f.write(comment_line + '\n')
+
+            # Write CSV data
             writer = csv.DictWriter(f, fieldnames=['channel_name', 'stream_url', 'status', 'format', 'framerate_num', 'error_type', 'error'], extrasaction='ignore')
             writer.writeheader()
             writer.writerows(results)
