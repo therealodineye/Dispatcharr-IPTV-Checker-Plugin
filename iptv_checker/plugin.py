@@ -15,11 +15,11 @@ import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Setup logging using Dispatcharr's format
+# Setup logging using Dispatcharr's format with plugin name prefix
 LOGGER = logging.getLogger("plugins.iptv_checker")
 if not LOGGER.handlers:
     handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(levelname)s %(name)s %(message)s")
+    formatter = logging.Formatter("[IPTV Checker] %(levelname)s %(message)s")
     handler.setFormatter(formatter)
     LOGGER.addHandler(handler)
 LOGGER.setLevel(logging.INFO)
@@ -222,7 +222,7 @@ class Plugin:
         self.cached_token = None  # Cached API token
         self.token_cache_time = None  # Time when token was cached
         self.token_cache_duration = 3600  # Cache token for 1 hour (3600 seconds)
-        LOGGER.info(f"{self.name} Plugin v{self.version} initialized")
+        LOGGER.info(f"Plugin v{self.version} initialized")
 
     def _load_progress(self):
         """Load check progress from persistent storage"""
@@ -244,7 +244,7 @@ class Plugin:
 
     def run(self, action, params, context):
         """Main plugin entry point"""
-        LOGGER.info(f"IPTV Checker run called with action: {action}")
+        LOGGER.info(f"Run called with action: {action}")
         LOGGER.info(f"Plugin key from context: {context.get('plugin_key', 'unknown')}")  # Debug line
         
         try:
@@ -802,6 +802,7 @@ class Plugin:
             logger.error(f"Background stream processing error: {e}")
         finally:
             self.check_progress['status'] = 'idle'
+            self.check_progress['end_time'] = time.time()
             self._save_progress()
             self._stop_status_updates()
 
@@ -909,6 +910,7 @@ class Plugin:
             logger.error(f"Background parallel stream processing error: {e}")
         finally:
             self.check_progress['status'] = 'idle'
+            self.check_progress['end_time'] = time.time()
             self._save_progress()
             self._stop_status_updates()
 
@@ -1122,6 +1124,28 @@ class Plugin:
         lines.append(f"# Plugin Version: {self.version}")
         lines.append("#")
 
+        # Add timing information
+        if self.check_progress.get('start_time') and self.check_progress.get('end_time'):
+            start_time = self.check_progress['start_time']
+            end_time = self.check_progress['end_time']
+            start_str = datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+            end_str = datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+            duration_seconds = end_time - start_time
+            hours = int(duration_seconds // 3600)
+            minutes = int((duration_seconds % 3600) // 60)
+            seconds = int(duration_seconds % 60)
+
+            lines.append("# Check Timing:")
+            lines.append(f"#   Start Time: {start_str}")
+            lines.append(f"#   End Time: {end_str}")
+            if hours > 0:
+                lines.append(f"#   Duration: {hours}h {minutes}m {seconds}s")
+            elif minutes > 0:
+                lines.append(f"#   Duration: {minutes}m {seconds}s")
+            else:
+                lines.append(f"#   Duration: {seconds}s")
+            lines.append("#")
+
         # Add plugin settings (excluding sensitive information)
         lines.append("# Plugin Settings:")
         lines.append(f"#   Group(s) Checked: {settings.get('group_names', 'All groups')}")
@@ -1199,12 +1223,12 @@ class Plugin:
         if not os.path.exists(self.results_file): return {"status": "error", "message": "No results to export."}
         with open(self.results_file, 'r') as f: results = json.load(f)
 
-        # Round framerate to 1 decimal place for cleaner CSV
+        # Round framerate to whole number for cleaner CSV
         for result in results:
             if 'framerate_num' in result and result['framerate_num'] > 0:
-                result['framerate_num'] = round(result['framerate_num'], 1)
+                result['framerate_num'] = round(result['framerate_num'])
 
-        filepath = f"/data/exports/iptv_check_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filepath = f"/data/exports/iptv_checker_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         os.makedirs("/data/exports", exist_ok=True)
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             # Write header comments
@@ -1213,7 +1237,7 @@ class Plugin:
                 f.write(comment_line + '\n')
 
             # Write CSV data
-            writer = csv.DictWriter(f, fieldnames=['channel_name', 'stream_url', 'status', 'format', 'framerate_num', 'error_type', 'error'], extrasaction='ignore')
+            writer = csv.DictWriter(f, fieldnames=['channel_id', 'channel_name', 'stream_id', 'status', 'format', 'framerate_num', 'error_type', 'error'], extrasaction='ignore')
             writer.writeheader()
             writer.writerows(results)
         return {"status": "success", "message": f"Results exported to {filepath}"}
@@ -1226,7 +1250,7 @@ class Plugin:
             return {"status": "info", "message": "No exports directory found. No CSV files to delete."}
 
         # Find all CSV files that match our naming pattern
-        csv_files = [f for f in os.listdir(exports_dir) if f.startswith('iptv_check_results_') and f.endswith('.csv')]
+        csv_files = [f for f in os.listdir(exports_dir) if f.startswith('iptv_checker_results_') and f.endswith('.csv')]
 
         if not csv_files:
             return {"status": "info", "message": "No CSV export files found in /data/exports/."}
