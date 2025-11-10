@@ -1408,11 +1408,13 @@ class Plugin:
         if '-show_streams' not in cmd:
             cmd.append('-show_streams')
 
-        # If using frame or packet analysis, add duration limit
+        # If using frame or packet analysis, add duration limit using read_intervals
         analysis_duration = 0
         if any(flag in cmd for flag in ['-show_frames', '-show_packets']):
             analysis_duration = settings.get('ffprobe_analysis_duration', 5) if settings else 5
-            cmd.extend(['-t', str(analysis_duration)])
+            # Use -read_intervals which is the correct ffprobe option (not -t which is for ffmpeg)
+            # Format: %+<duration> reads <duration> seconds from the start
+            cmd.extend(['-read_intervals', f'%+{analysis_duration}'])
             logger.debug(f"Added analysis duration: {analysis_duration} seconds for frame/packet analysis")
 
         # Add URL at the end
@@ -1486,7 +1488,9 @@ class Plugin:
                     error_lower = error_output.lower()
                     if 'timed out' in error_lower or 'timeout' in error_lower or 'connection timeout' in error_lower:
                         last_error_type = 'Timeout'
-                    elif '404' in error_output or 'not found' in error_lower or 'no such file' in error_lower:
+                    elif 'option not found' in error_lower or 'unrecognized option' in error_lower:
+                        last_error_type = 'FFprobe Option Error'
+                    elif '404' in error_output or ('not found' in error_lower and 'http' in error_lower):
                         last_error_type = '404 Not Found'
                     elif '403' in error_output or 'forbidden' in error_lower:
                         last_error_type = '403 Forbidden'
