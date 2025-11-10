@@ -141,9 +141,19 @@ class Plugin:
             "description": "Load channels from the specified Dispatcharr group(s) (or all groups if blank).",
         },
         {
-            "id": "process_and_monitor",
-            "label": "🔍 Process & Monitor Streams",
-            "description": "Check stream status and quality, or view current progress and results.",
+            "id": "check_streams",
+            "label": "▶️ Start Stream Check",
+            "description": "Start checking stream status and quality for all loaded channels.",
+        },
+        {
+            "id": "view_progress",
+            "label": "📊 View Check Progress",
+            "description": "View the current progress and ETA of the running stream check.",
+        },
+        {
+            "id": "view_results",
+            "label": "📋 View Last Results",
+            "description": "View summary of the last completed stream check.",
         },
         {
             "id": "rename_channels",
@@ -213,7 +223,9 @@ class Plugin:
             action_map = {
                 "validate_settings": self.validate_settings_action,
                 "load_groups": self.load_groups_action,
-                "process_and_monitor": self.process_and_monitor_action,
+                "check_streams": self.check_streams_action,
+                "view_progress": self.view_progress_action,
+                "view_results": self.view_results_action,
                 "rename_channels": self.rename_channels_action,
                 "move_dead_channels": self.move_dead_channels_action,
                 "rename_low_framerate_channels": self.rename_low_framerate_channels_action,
@@ -227,7 +239,7 @@ class Plugin:
                 return {"status": "error", "message": f"Unknown action: {action}"}
 
             # Pass context to actions that need it
-            if action in ["process_and_monitor"]:
+            if action in ["check_streams"]:
                 return action_map[action](settings, logger, context)
             else:
                 return action_map[action](settings, logger)
@@ -398,60 +410,64 @@ class Plugin:
 
         return {"status": status, "message": message}
 
-    def process_and_monitor_action(self, settings, logger, context):
-        """Smart action that combines stream processing and monitoring."""
-        # Check if a check is currently running
-        if self.check_progress['status'] == 'running':
-            # Return current status
-            current, total = self.check_progress['current'], self.check_progress['total']
-            percent = (current / total * 100) if total > 0 else 0
+    def view_progress_action(self, settings, logger):
+        """View the current progress of a running stream check."""
+        if self.check_progress['status'] != 'running':
+            return {"status": "info", "message": "No stream check is currently running.\n\nUse '▶️ Start Stream Check' to begin checking streams."}
 
-            # Calculate ETA
-            if self.check_progress.get('start_time') and current > 0:
-                elapsed_seconds = time.time() - self.check_progress['start_time']
-                avg_time_per_stream = elapsed_seconds / current
-                remaining_streams = total - current
-                eta_seconds = remaining_streams * avg_time_per_stream
-                eta_minutes = eta_seconds / 60
+        current, total = self.check_progress['current'], self.check_progress['total']
+        percent = (current / total * 100) if total > 0 else 0
 
-                if eta_minutes < 1:
-                    eta_str = f"ETA: <1 min"
-                else:
-                    eta_str = f"ETA: {eta_minutes:.0f} min"
+        # Calculate ETA
+        if self.check_progress.get('start_time') and current > 0:
+            elapsed_seconds = time.time() - self.check_progress['start_time']
+            avg_time_per_stream = elapsed_seconds / current
+            remaining_streams = total - current
+            eta_seconds = remaining_streams * avg_time_per_stream
+            eta_minutes = eta_seconds / 60
+
+            if eta_minutes < 1:
+                eta_str = f"ETA: <1 min"
             else:
-                eta_str = "ETA: calculating..."
+                eta_str = f"ETA: {eta_minutes:.0f} min"
+        else:
+            eta_str = "ETA: calculating..."
 
-            message = f"🔄 Checking streams {current}/{total} - {percent:.0f}% complete | {eta_str}"
-            return {"status": "success", "message": message}
+        message = f"🔄 Checking streams {current}/{total} - {percent:.0f}% complete | {eta_str}"
+        return {"status": "success", "message": message}
 
-        # Check if we have previous results to show
-        if os.path.exists(self.results_file):
-            with open(self.results_file, 'r') as f:
-                results = json.load(f)
+    def view_results_action(self, settings, logger):
+        """View summary of the last completed stream check."""
+        if self.check_progress['status'] == 'running':
+            return {"status": "info", "message": "A stream check is currently running.\n\nUse '📊 View Check Progress' to see the current status."}
 
-            if results:
-                # Show results summary
-                alive = sum(1 for r in results if r.get('status') == 'Alive')
-                formats = {r.get('format', 'Unknown'): 0 for r in results if r.get('status') == 'Alive'}
-                for r in results:
-                    if r.get('status') == 'Alive':
-                        formats[r.get('format', 'Unknown')] += 1
+        if not os.path.exists(self.results_file):
+            return {"status": "info", "message": "No results available yet.\n\nUse '▶️ Start Stream Check' to begin checking streams."}
 
-                summary = [
-                    f"📊 Last Check Results ({len(results)} streams):",
-                    f"✅ Alive: {alive}",
-                    f"❌ Dead: {len(results) - alive}\n",
-                    "📺 Alive Stream Formats:"
-                ]
-                for fmt, count in sorted(formats.items()):
-                    if count > 0:
-                        summary.append(f"  • {fmt}: {count}")
+        with open(self.results_file, 'r') as f:
+            results = json.load(f)
 
-                summary.append("\n💡 Click again to start a new check.")
-                return {"status": "success", "message": "\n".join(summary)}
+        if not results:
+            return {"status": "info", "message": "No results available yet.\n\nUse '▶️ Start Stream Check' to begin checking streams."}
 
-        # No check running and no results - start a new check
-        return self.check_streams_action(settings, logger, context)
+        # Show results summary
+        alive = sum(1 for r in results if r.get('status') == 'Alive')
+        formats = {r.get('format', 'Unknown'): 0 for r in results if r.get('status') == 'Alive'}
+        for r in results:
+            if r.get('status') == 'Alive':
+                formats[r.get('format', 'Unknown')] += 1
+
+        summary = [
+            f"📊 Last Check Results ({len(results)} streams):",
+            f"✅ Alive: {alive}",
+            f"❌ Dead: {len(results) - alive}\n",
+            "📺 Alive Stream Formats:"
+        ]
+        for fmt, count in sorted(formats.items()):
+            if count > 0:
+                summary.append(f"  • {fmt}: {count}")
+
+        return {"status": "success", "message": "\n".join(summary)}
 
     def _get_api_token(self, settings, logger, force_refresh=False):
         """Get an API access token using username and password with caching."""
@@ -585,7 +601,7 @@ class Plugin:
             if 'invalid_names' in locals() and invalid_names:
                 message += f"\n\nWarning: Ignored groups not found: {', '.join(invalid_names)}"
             if total_streams > 0:
-                message += f"\n\nNext, run 'Check Streams'. Estimated time{mode_info}: {estimated_minutes:.0f} minutes."
+                message += f"\n\nNext, click '▶️ Start Stream Check'. Estimated time{mode_info}: {estimated_minutes:.0f} minutes."
                 if not parallel_enabled and total_streams > 50:
                     message += f"\n\nTip: Enable 'Parallel Stream Checking' in settings to speed up processing significantly!"
 
@@ -594,10 +610,16 @@ class Plugin:
 
     def check_streams_action(self, settings, logger, context=None):
         """Check status and format of all loaded streams with auto status updates."""
+        # Check if a check is already running
+        if self.check_progress['status'] == 'running':
+            current, total = self.check_progress['current'], self.check_progress['total']
+            percent = (current / total * 100) if total > 0 else 0
+            return {"status": "info", "message": f"A stream check is already running ({percent:.0f}% complete).\n\nUse '📊 View Check Progress' to monitor the current check."}
+
         if not os.path.exists(self.loaded_channels_file):
-            return {"status": "error", "message": "No channels loaded. Please run 'Load Group(s)' first."}
-        
-        with open(self.loaded_channels_file, 'r') as f: 
+            return {"status": "error", "message": "No channels loaded. Please run '📥 Load Group(s)' first."}
+
+        with open(self.loaded_channels_file, 'r') as f:
             loaded_channels = json.load(f)
         
         all_streams = [
@@ -637,7 +659,7 @@ class Plugin:
         processing_thread.daemon = True
         processing_thread.start()
 
-        return {"status": "success", "message": f"Stream checking started for {len(all_streams)} streams.\nEstimated completion time{mode_info}: {estimated_total_time:.0f} minutes.\n\nUse 'Get Status Update' or 'View Last Results' to monitor progress."}
+        return {"status": "success", "message": f"✅ Stream checking started for {len(all_streams)} streams.\nEstimated completion time{mode_info}: {estimated_total_time:.0f} minutes.\n\nUse '📊 View Check Progress' to monitor progress."}
 
     def _process_streams_background(self, all_streams, settings, logger):
         """Background processing of streams to avoid request timeout"""
@@ -1028,24 +1050,6 @@ class Plugin:
             lines.append(f"{r.get('channel_name', 'N/A')[:34]:<35} {r.get('status', 'N/A'):<8} {r.get('format', 'N/A'):<8} {fps_str:<8} {error_type:<20} {error_details:<35}")
         lines.append("="*120)
         return {"status": "success", "message": "\n".join(lines)}
-
-    def get_results_action(self, settings, logger):
-        """Display summary of last check or live progress."""
-        if self.check_progress['status'] == 'running':
-            current, total = self.check_progress['current'], self.check_progress['total']
-            percent = (current / total * 100) if total > 0 else 0
-            return {"status": "success", "message": f"Checking streams {current}/{total} - {percent:.0f}% complete"}
-
-        if not os.path.exists(self.results_file): return {"status": "error", "message": "No results available."}
-        with open(self.results_file, 'r') as f: results = json.load(f)
-        alive = sum(1 for r in results if r.get('status') == 'Alive')
-        formats = {r.get('format', 'Unknown'): 0 for r in results if r.get('status') == 'Alive'}
-        for r in results:
-            if r.get('status') == 'Alive': formats[r.get('format', 'Unknown')] += 1
-        summary = [f"Check Summary ({len(results)} streams):", f"• Alive: {alive}", f"• Dead: {len(results) - alive}\n", "Alive Stream Formats:"]
-        for fmt, count in sorted(formats.items()):
-            if count > 0: summary.append(f"• {fmt}: {count}")
-        return {"status": "success", "message": "\n".join(summary)}
 
     def _generate_csv_header_comments(self, settings, results):
         """Generate CSV header comments with settings and statistics"""
