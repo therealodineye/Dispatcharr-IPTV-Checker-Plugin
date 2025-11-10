@@ -2,19 +2,6 @@
 
 **Description:** Check IPTV stream status, analyze stream quality, and manage channels based on results
 
-**Latest Version:** 0.2.1 (Released September 25, 2025)
-
-## What's New in 0.2.1
-
-- **Background Processing:** Stream checks now run in background threads, preventing browser timeouts during long-running checks
-- **Real-Time ETA:** Dynamic ETA calculation based on actual processing speed with live updates
-- **Smart Retry System:** Timeout streams are queued and retried after processing other streams (not immediately), improving success rates
-- **Enhanced Error Categorization:** Detailed error types including Timeout, 404 Not Found, 403 Forbidden, 500 Server Error, Connection Refused, Network Unreachable, Invalid Stream, and more
-- **3-Second Delays:** Added delays between stream checks for server stability and reliability
-- **Improved Time Estimates:** More accurate estimates based on real-world data (~8.5s per stream average with 20% buffer)
-- **Enhanced CSV Exports:** Now includes error_type field and rounded framerate values
-- **Better Progress Tracking:** Processing continues independently of browser connection
-
 ## Features
 
 - **Stream Status Checking:** Verify if IPTV streams are alive or dead with smart retry logic
