@@ -151,6 +151,11 @@ class Plugin:
             "description": "View the current progress and ETA of the running stream check.",
         },
         {
+            "id": "cancel_check",
+            "label": "🛑 Cancel Stream Check",
+            "description": "Cancel the currently running stream check.",
+        },
+        {
             "id": "view_results",
             "label": "📋 View Last Results",
             "description": "View summary of the last completed stream check.",
@@ -194,6 +199,12 @@ class Plugin:
             "id": "export_results",
             "label": "💾 Export Results to CSV",
             "description": "Export the last check results to a CSV file. Will be saved in Docker container: /data/exports/"
+        },
+        {
+            "id": "clear_csv_exports",
+            "label": "🗑️ Clear CSV Exports",
+            "description": "Delete all CSV export files created by this plugin.",
+            "confirm": { "required": True, "title": "Clear All CSV Exports?", "message": "This will delete all CSV files in /data/exports/. This action cannot be undone. Continue?" }
         }
     ]
     
@@ -201,6 +212,7 @@ class Plugin:
         self.results_file = "/data/iptv_checker_results.json"
         self.loaded_channels_file = "/data/iptv_checker_loaded_channels.json"
         self.check_progress = {"current": 0, "total": 0, "status": "idle", "start_time": None}
+        self.check_lock = threading.Lock()  # Lock to prevent duplicate checks
         self.status_thread = None
         self.stop_status_updates = False
         self.pending_status_message = None
@@ -225,6 +237,7 @@ class Plugin:
                 "load_groups": self.load_groups_action,
                 "check_streams": self.check_streams_action,
                 "view_progress": self.view_progress_action,
+                "cancel_check": self.cancel_check_action,
                 "view_results": self.view_results_action,
                 "rename_channels": self.rename_channels_action,
                 "move_dead_channels": self.move_dead_channels_action,
@@ -233,6 +246,7 @@ class Plugin:
                 "add_video_format_suffix": self.add_video_format_suffix_action,
                 "view_table": self.view_table_action,
                 "export_results": self.export_results_action,
+                "clear_csv_exports": self.clear_csv_exports_action,
             }
 
             if action not in action_map:
@@ -436,6 +450,25 @@ class Plugin:
         message = f"🔄 Checking streams {current}/{total} - {percent:.0f}% complete | {eta_str}"
         return {"status": "success", "message": message}
 
+    def cancel_check_action(self, settings, logger):
+        """Cancel the currently running stream check."""
+        if self.check_progress['status'] != 'running':
+            return {"status": "info", "message": "No stream check is currently running."}
+
+        # Signal the background thread to stop
+        self._stop_status_updates()
+
+        # Get current progress for the message
+        current = self.check_progress['current']
+        total = self.check_progress['total']
+
+        # Reset status to idle
+        self.check_progress['status'] = 'idle'
+
+        logger.info(f"Stream check cancelled by user. Processed {current}/{total} streams before cancellation.")
+
+        return {"status": "success", "message": f"✅ Stream check cancelled.\n\nProcessed {current}/{total} streams before cancellation.\n\nPartial results have been saved and can be viewed with '📋 View Last Results'."}
+
     def view_results_action(self, settings, logger):
         """View summary of the last completed stream check."""
         if self.check_progress['status'] == 'running':
@@ -610,32 +643,35 @@ class Plugin:
 
     def check_streams_action(self, settings, logger, context=None):
         """Check status and format of all loaded streams with auto status updates."""
-        # Check if a check is already running
-        if self.check_progress['status'] == 'running':
-            current, total = self.check_progress['current'], self.check_progress['total']
-            percent = (current / total * 100) if total > 0 else 0
-            return {"status": "info", "message": f"A stream check is already running ({percent:.0f}% complete).\n\nUse '📊 View Check Progress' to monitor the current check."}
+        # Use lock to prevent race condition when starting multiple checks
+        with self.check_lock:
+            # Check if a check is already running
+            if self.check_progress['status'] == 'running':
+                current, total = self.check_progress['current'], self.check_progress['total']
+                percent = (current / total * 100) if total > 0 else 0
+                return {"status": "info", "message": f"A stream check is already running ({percent:.0f}% complete).\n\nUse '📊 View Check Progress' to monitor the current check."}
 
-        if not os.path.exists(self.loaded_channels_file):
-            return {"status": "error", "message": "No channels loaded. Please run '📥 Load Group(s)' first."}
+            if not os.path.exists(self.loaded_channels_file):
+                return {"status": "error", "message": "No channels loaded. Please run '📥 Load Group(s)' first."}
 
-        with open(self.loaded_channels_file, 'r') as f:
-            loaded_channels = json.load(f)
-        
-        all_streams = [
-            {"channel_id": ch['id'], "channel_name": ch['name'], "stream_url": s['url'], "stream_id": s['id']}
-            for ch in loaded_channels for s in ch.get('streams', []) if s.get('url')
-        ]
-        
-        if not all_streams: 
-            return {"status": "error", "message": "The loaded groups contain no streams to check."}
+            with open(self.loaded_channels_file, 'r') as f:
+                loaded_channels = json.load(f)
 
-        self.check_progress = {"current": 0, "total": len(all_streams), "status": "running", "start_time": time.time()}
-        logger.info(f"Starting check for {len(all_streams)} streams...")
-        
-        # Start background status updates
-        if context:
-            self._start_status_updates(context)
+            all_streams = [
+                {"channel_id": ch['id'], "channel_name": ch['name'], "stream_url": s['url'], "stream_id": s['id']}
+                for ch in loaded_channels for s in ch.get('streams', []) if s.get('url')
+            ]
+
+            if not all_streams:
+                return {"status": "error", "message": "The loaded groups contain no streams to check."}
+
+            # Set status to running atomically within the lock
+            self.check_progress = {"current": 0, "total": len(all_streams), "status": "running", "start_time": time.time()}
+            logger.info(f"Starting check for {len(all_streams)} streams...")
+
+            # Start background status updates
+            if context:
+                self._start_status_updates(context)
         
         # Return immediately to avoid timeout, processing continues in background
         timeout = settings.get("timeout", 10)
@@ -1154,6 +1190,37 @@ class Plugin:
             writer.writeheader()
             writer.writerows(results)
         return {"status": "success", "message": f"Results exported to {filepath}"}
+
+    def clear_csv_exports_action(self, settings, logger):
+        """Delete all CSV export files created by this plugin."""
+        exports_dir = "/data/exports"
+
+        if not os.path.exists(exports_dir):
+            return {"status": "info", "message": "No exports directory found. No CSV files to delete."}
+
+        # Find all CSV files that match our naming pattern
+        csv_files = [f for f in os.listdir(exports_dir) if f.startswith('iptv_check_results_') and f.endswith('.csv')]
+
+        if not csv_files:
+            return {"status": "info", "message": "No CSV export files found in /data/exports/."}
+
+        # Delete all matching CSV files
+        deleted_count = 0
+        for csv_file in csv_files:
+            try:
+                filepath = os.path.join(exports_dir, csv_file)
+                os.remove(filepath)
+                deleted_count += 1
+                logger.info(f"Deleted CSV export: {csv_file}")
+            except Exception as e:
+                logger.error(f"Failed to delete {csv_file}: {e}")
+
+        if deleted_count == 0:
+            return {"status": "error", "message": "Failed to delete any CSV files."}
+        elif deleted_count < len(csv_files):
+            return {"status": "success", "message": f"⚠️ Partially cleared: Deleted {deleted_count} of {len(csv_files)} CSV files.\n\nSome files could not be deleted. Check logs for details."}
+        else:
+            return {"status": "success", "message": f"✅ Successfully deleted {deleted_count} CSV export file(s) from /data/exports/."}
 
     def _perform_bulk_patch(self, token, settings, logger, payload):
         """Send a bulk PATCH request to the Dispatcharr API."""
