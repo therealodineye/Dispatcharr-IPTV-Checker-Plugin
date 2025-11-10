@@ -49,6 +49,33 @@ docker exec dispatcharr which ffmpeg
 3. Click **Import Plugin** and upload the plugin zip file
 4. Enable the plugin after installation
 
+### Updating the Plugin
+
+To update EPG Janitor:
+
+1. **Remove Old Plugin**
+   * Navigate to **Plugins** in Dispatcharr
+   * Click the trash icon next to the old EPG Janitor plugin
+   * Confirm deletion
+
+2. **Restart Dispatcharr**
+   * Log out of Dispatcharr
+   * Restart the Docker container:
+     ```bash
+     docker restart dispatcharr
+     ```
+
+3. **Install Updated Plugin**
+   * Log back into Dispatcharr
+   * Navigate to **Plugins**
+   * Click **Import Plugin** and upload the new plugin zip file
+   * Enable the plugin after installation
+
+4. **Verify Installation**
+   * Check that the plugin appears in the plugin list
+   * Reconfigure your settings if needed
+   * Run "Preview Auto-Match (Dry Run)" to test the plugin
+
 ## Settings Reference
 
 | Setting | Type | Default | Description |
