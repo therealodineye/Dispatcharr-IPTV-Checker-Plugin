@@ -35,7 +35,7 @@ class Plugin:
     # Explicitly set the plugin key
     key = "iptv_checker"
     name = "IPTV Checker"
-    version = "0.3.0"
+    version = "0.3.1"
     description = "Check stream status and quality for channels in specified Dispatcharr groups."
 
     @property
