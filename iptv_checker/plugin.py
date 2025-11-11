@@ -1060,7 +1060,7 @@ class Plugin:
 
     def rename_channels_action(self, settings, logger):
         """Rename channels that were marked as dead in the last check."""
-        rename_format = settings.get("dead_rename_format", "").strip()
+        rename_format = settings.get("dead_rename_format", "{name} [DEAD]").strip()
         if not rename_format:
             return {"status": "error", "message": "Please configure a Dead Channel Rename Format before renaming."}
 
@@ -1131,7 +1131,7 @@ class Plugin:
         
     def rename_low_framerate_channels_action(self, settings, logger):
         """Rename channels with low framerate streams."""
-        rename_format = settings.get("low_framerate_rename_format", "").strip()
+        rename_format = settings.get("low_framerate_rename_format", "{name} [Slow]").strip()
 
         if not rename_format:
             return {"status": "error", "message": "Please configure a Low Framerate Rename Format."}
