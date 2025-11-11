@@ -724,16 +724,27 @@ class Plugin:
         response.raise_for_status()
         return response.json()
 
-    def _trigger_m3u_refresh(self, token, settings, logger):
-        """Triggers a global M3U refresh to update the GUI via WebSockets."""
-        logger.info("Triggering M3U refresh to update the GUI...")
+    def _trigger_frontend_refresh(self, settings, logger):
+        """Trigger frontend channel list refresh via WebSocket"""
         try:
-            self._post_api_data("/api/m3u/refresh/", token, {}, settings)
-            logger.info("M3U refresh triggered successfully.")
-            return True
+            from channels.layers import get_channel_layer
+            from asgiref.sync import async_to_sync
+
+            channel_layer = get_channel_layer()
+            if channel_layer:
+                # Send WebSocket message to trigger frontend refresh
+                async_to_sync(channel_layer.group_send)(
+                    "dispatcharr_updates",
+                    {
+                        "type": "channels.updated",
+                        "message": "Channel list updated by IPTV Checker"
+                    }
+                )
+                logger.info("Frontend refresh triggered via WebSocket")
+                return True
         except Exception as e:
-            logger.error(f"Failed to trigger M3U refresh: {e}")
-            return False
+            logger.warning(f"Could not trigger frontend refresh: {e}")
+        return False
 
     def load_groups_action(self, settings, logger):
         """Load channels and streams from specified Dispatcharr groups."""
@@ -1083,7 +1094,7 @@ class Plugin:
             token, error = self._get_api_token(settings, logger)
             if error: return {"status": "error", "message": error}
             count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully renamed {count} dead channels. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
 
@@ -1119,7 +1130,7 @@ class Plugin:
             
             payload = [{'id': cid, 'channel_group_id': new_group_id} for cid in dead_channel_ids]
             moved_count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully moved {moved_count} dead channels to group '{move_to_group_name}'. GUI refresh triggered."}
 
         except Exception as e: return {"status": "error", "message": str(e)}
@@ -1155,7 +1166,7 @@ class Plugin:
             token, error = self._get_api_token(settings, logger)
             if error: return {"status": "error", "message": error}
             count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully renamed {count} low framerate channels. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
 
@@ -1189,7 +1200,7 @@ class Plugin:
             
             payload = [{'id': cid, 'channel_group_id': new_group_id} for cid in low_fps_channel_ids]
             moved_count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully moved {moved_count} low framerate channels to group '{group_name}'. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
 
@@ -1198,40 +1209,82 @@ class Plugin:
         suffixes_to_add_str = settings.get("video_format_suffixes", "UHD, FHD, HD, SD, Unknown").strip().lower()
         if not suffixes_to_add_str:
             return {"status": "error", "message": "Please specify which video formats should have a suffix added."}
-        
+
         suffixes_to_add = {s.strip() for s in suffixes_to_add_str.split(',')}
-        
+        logger.info(f"DEBUG: Configured suffixes to add: {suffixes_to_add}")
+
         if not os.path.exists(self.results_file):
             return {"status": "error", "message": "No check results found. Please run 'Check Streams' first."}
 
         with open(self.results_file, 'r') as f: results = json.load(f)
-        
+        logger.info(f"DEBUG: Loaded {len(results)} results from last check")
+
         channel_formats = {}
         for r in results:
             if r['status'] == 'Alive':
                 channel_formats[r['channel_id']] = r.get('format', 'Unknown')
+
+        logger.info(f"DEBUG: Found {len(channel_formats)} alive channels in results")
+        if channel_formats:
+            # Log format distribution
+            format_counts = {}
+            for fmt in channel_formats.values():
+                format_counts[fmt] = format_counts.get(fmt, 0) + 1
+            logger.info(f"DEBUG: Format distribution: {format_counts}")
 
         if not channel_formats: return {"status": "success", "message": "No alive channels found to update."}
 
         try:
             token, error = self._get_api_token(settings, logger)
             if error: return {"status": "error", "message": error}
-            
+
             all_channels = self._get_api_data("/api/channels/channels/", token, settings)
             channel_id_to_name = {c['id']: c['name'] for c in all_channels}
+            logger.info(f"DEBUG: Retrieved {len(all_channels)} channels from API")
 
             payload = []
+            skipped_not_in_suffixes = 0
+            skipped_already_has_suffix = 0
+            skipped_channel_not_found = 0
+
             for cid, fmt in channel_formats.items():
-                if fmt.lower() in suffixes_to_add:
-                    current_name = channel_id_to_name.get(cid)
-                    suffix = f" [{fmt.upper()}]"
-                    if current_name and not current_name.endswith(suffix):
-                        payload.append({'id': cid, 'name': current_name + suffix})
+                logger.debug(f"DEBUG: Processing channel_id={cid}, format='{fmt}'")
+
+                # Check if format is in the list of formats to add suffixes for
+                if fmt.lower() not in suffixes_to_add:
+                    logger.debug(f"DEBUG:   - Skipped: format '{fmt}' not in configured suffixes")
+                    skipped_not_in_suffixes += 1
+                    continue
+
+                current_name = channel_id_to_name.get(cid)
+                if not current_name:
+                    logger.debug(f"DEBUG:   - Skipped: channel_id {cid} not found in API channels")
+                    skipped_channel_not_found += 1
+                    continue
+
+                suffix = f" [{fmt.upper()}]"
+                logger.debug(f"DEBUG:   - Current name: '{current_name}'")
+                logger.debug(f"DEBUG:   - Will add suffix: '{suffix}'")
+                logger.debug(f"DEBUG:   - Already ends with suffix? {current_name.endswith(suffix)}")
+
+                if current_name.endswith(suffix):
+                    logger.debug(f"DEBUG:   - Skipped: already has suffix '{suffix}'")
+                    skipped_already_has_suffix += 1
+                else:
+                    new_name = current_name + suffix
+                    logger.info(f"DEBUG:   ✓ Adding to payload: '{current_name}' -> '{new_name}'")
+                    payload.append({'id': cid, 'name': new_name})
+
+            logger.info(f"DEBUG: Payload summary:")
+            logger.info(f"DEBUG:   - Channels to update: {len(payload)}")
+            logger.info(f"DEBUG:   - Skipped (format not in configured list): {skipped_not_in_suffixes}")
+            logger.info(f"DEBUG:   - Skipped (already has suffix): {skipped_already_has_suffix}")
+            logger.info(f"DEBUG:   - Skipped (channel not found in API): {skipped_channel_not_found}")
 
             if not payload: return {"status": "success", "message": "No channels needed a format suffix added."}
-            
+
             updated_count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully added format suffixes to {updated_count} channels. GUI refresh triggered."}
 
         except Exception as e: return {"status": "error", "message": str(e)}
