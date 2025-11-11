@@ -724,16 +724,27 @@ class Plugin:
         response.raise_for_status()
         return response.json()
 
-    def _trigger_m3u_refresh(self, token, settings, logger):
-        """Triggers a global M3U refresh to update the GUI via WebSockets."""
-        logger.info("Triggering M3U refresh to update the GUI...")
+    def _trigger_frontend_refresh(self, settings, logger):
+        """Trigger frontend channel list refresh via WebSocket"""
         try:
-            self._post_api_data("/api/m3u/refresh/", token, {}, settings)
-            logger.info("M3U refresh triggered successfully.")
-            return True
+            from channels.layers import get_channel_layer
+            from asgiref.sync import async_to_sync
+
+            channel_layer = get_channel_layer()
+            if channel_layer:
+                # Send WebSocket message to trigger frontend refresh
+                async_to_sync(channel_layer.group_send)(
+                    "dispatcharr_updates",
+                    {
+                        "type": "channels.updated",
+                        "message": "Channel list updated by IPTV Checker"
+                    }
+                )
+                logger.info("Frontend refresh triggered via WebSocket")
+                return True
         except Exception as e:
-            logger.error(f"Failed to trigger M3U refresh: {e}")
-            return False
+            logger.warning(f"Could not trigger frontend refresh: {e}")
+        return False
 
     def load_groups_action(self, settings, logger):
         """Load channels and streams from specified Dispatcharr groups."""
@@ -1083,7 +1094,7 @@ class Plugin:
             token, error = self._get_api_token(settings, logger)
             if error: return {"status": "error", "message": error}
             count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully renamed {count} dead channels. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
 
@@ -1119,7 +1130,7 @@ class Plugin:
             
             payload = [{'id': cid, 'channel_group_id': new_group_id} for cid in dead_channel_ids]
             moved_count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully moved {moved_count} dead channels to group '{move_to_group_name}'. GUI refresh triggered."}
 
         except Exception as e: return {"status": "error", "message": str(e)}
@@ -1155,7 +1166,7 @@ class Plugin:
             token, error = self._get_api_token(settings, logger)
             if error: return {"status": "error", "message": error}
             count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully renamed {count} low framerate channels. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
 
@@ -1189,7 +1200,7 @@ class Plugin:
             
             payload = [{'id': cid, 'channel_group_id': new_group_id} for cid in low_fps_channel_ids]
             moved_count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully moved {moved_count} low framerate channels to group '{group_name}'. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
 
@@ -1273,7 +1284,7 @@ class Plugin:
             if not payload: return {"status": "success", "message": "No channels needed a format suffix added."}
 
             updated_count = self._perform_bulk_patch(token, settings, logger, payload)
-            self._trigger_m3u_refresh(token, settings, logger)
+            self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully added format suffixes to {updated_count} channels. GUI refresh triggered."}
 
         except Exception as e: return {"status": "error", "message": str(e)}
