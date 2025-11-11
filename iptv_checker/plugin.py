@@ -498,7 +498,7 @@ class Plugin:
             validation_results.append("❌ Dispatcharr URL is not configured")
             has_errors = True
         else:
-            validation_results.append(f"✅ URL: {dispatcharr_url}")
+            validation_results.append("✅ Dispatcharr URL configured")
 
         # Validate credentials
         username = settings.get("dispatcharr_username", "").strip()
@@ -508,13 +508,13 @@ class Plugin:
             validation_results.append("❌ Admin Username is not configured")
             has_errors = True
         else:
-            validation_results.append(f"✅ Username: {username}")
+            validation_results.append("✅ Admin Username configured")
 
         if not password:
             validation_results.append("❌ Admin Password is not configured")
             has_errors = True
         else:
-            validation_results.append("✅ Password configured")
+            validation_results.append("✅ Admin Password configured")
 
         # Test API connection if credentials are provided
         if dispatcharr_url and username and password:
@@ -1281,7 +1281,17 @@ class Plugin:
             logger.info(f"DEBUG:   - Skipped (already has suffix): {skipped_already_has_suffix}")
             logger.info(f"DEBUG:   - Skipped (channel not found in API): {skipped_channel_not_found}")
 
-            if not payload: return {"status": "success", "message": "No channels needed a format suffix added."}
+            if not payload:
+                reason_parts = []
+                if skipped_already_has_suffix > 0:
+                    reason_parts.append(f"{skipped_already_has_suffix} already have suffix")
+                if skipped_not_in_suffixes > 0:
+                    reason_parts.append(f"{skipped_not_in_suffixes} format not in configured list")
+                if skipped_channel_not_found > 0:
+                    reason_parts.append(f"{skipped_channel_not_found} not found in API")
+
+                reason = " • ".join(reason_parts) if reason_parts else "All channels already up to date"
+                return {"status": "success", "message": f"No channels needed a format suffix added.\n\nReason: {reason}"}
 
             updated_count = self._perform_bulk_patch(token, settings, logger, payload)
             self._trigger_frontend_refresh(settings, logger)
