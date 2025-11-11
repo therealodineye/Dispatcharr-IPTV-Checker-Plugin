@@ -497,8 +497,6 @@ class Plugin:
         if not dispatcharr_url:
             validation_results.append("❌ Dispatcharr URL is not configured")
             has_errors = True
-        else:
-            validation_results.append("✅ Dispatcharr URL configured")
 
         # Validate credentials
         username = settings.get("dispatcharr_username", "").strip()
@@ -507,24 +505,20 @@ class Plugin:
         if not username:
             validation_results.append("❌ Admin Username is not configured")
             has_errors = True
-        else:
-            validation_results.append("✅ Admin Username configured")
 
         if not password:
             validation_results.append("❌ Admin Password is not configured")
             has_errors = True
-        else:
-            validation_results.append("✅ Admin Password configured")
 
-        # Test API connection if credentials are provided
+        # Test API connection and login if all credentials are provided
         if dispatcharr_url and username and password:
             try:
                 token, error = self._get_api_token(settings, logger)
                 if error:
-                    validation_results.append(f"❌ API Connection Failed: {error}")
+                    validation_results.append(f"❌ API login failed: {error}")
                     has_errors = True
                 else:
-                    validation_results.append("✅ API connected")
+                    validation_results.append("✅ API login successful")
 
                     # Validate groups if specified
                     group_names_str = settings.get("group_names", "").strip()
@@ -1539,9 +1533,9 @@ class Plugin:
             'ffprobe_monitoring_seconds': 0
         }
 
-        # Log stream check start at INFO level for debugging
+        # Log stream check start at DEBUG level (reduced verbosity)
         retry_info = f" (retry {retry_attempt})" if retry_attempt > 0 else ""
-        logger.info(f"Checking stream{retry_info}: '{channel_name}' - URL: {url}")
+        logger.debug(f"Checking stream{retry_info}: '{channel_name}' - URL: {url}")
 
         # Determine how many attempts to make
         max_attempts = 1 if skip_retries else (retries + 1)
@@ -1587,8 +1581,8 @@ class Plugin:
         # Calculate total timeout: connection timeout + analysis duration + 2 second buffer
         total_timeout = timeout + analysis_duration + 2
 
-        # Log the ffprobe command being executed at INFO level
-        logger.info(f"Executing ffprobe command for '{channel_name}': {' '.join(cmd)}")
+        # Log the ffprobe command being executed at DEBUG level (reduced verbosity)
+        logger.debug(f"Executing ffprobe command for '{channel_name}': {' '.join(cmd)}")
 
         for attempt in range(max_attempts):
             try:
@@ -1627,7 +1621,7 @@ class Plugin:
                             ffprobe_extra_data['bitrate'] = video_stream.get('bit_rate', 'N/A')
 
                         stream_format = self._get_stream_format(resolution)
-                        logger.info(f"✓ Stream ALIVE: '{channel_name}' - Format: {stream_format}, Resolution: {resolution}, FPS: {framerate_num:.1f}, Codec: {ffprobe_extra_data.get('codec', 'N/A')}")
+                        logger.info(f"✓ '{channel_name}' ALIVE - {stream_format} {resolution} {framerate_num:.1f}fps")
 
                         return {
                             'status': 'Alive',
@@ -1643,7 +1637,6 @@ class Plugin:
                     else:
                         last_error = 'No video stream found'
                         last_error_type = 'No Video Stream'
-                        logger.info(f"✗ Stream DEAD: '{channel_name}' - Error Type: {last_error_type}, Reason: {last_error}")
                 else:
                     error_output = result.stderr.strip() or 'Stream not accessible'
                     last_error = error_output
@@ -1674,26 +1667,20 @@ class Plugin:
                     else:
                         last_error_type = 'Other'
 
-                    # Log the error at INFO level for debugging
-                    logger.info(f"✗ Stream DEAD: '{channel_name}' - Error Type: {last_error_type}, Return Code: {result.returncode}")
-                    logger.info(f"  FFprobe stderr: {error_output[:300]}")  # First 300 chars for context
-                        
             except subprocess.TimeoutExpired:
                 last_error = f'Connection timeout after {total_timeout} seconds'
                 last_error_type = 'Timeout'
-                logger.info(f"✗ Stream DEAD: '{channel_name}' - Error Type: {last_error_type}, Reason: Process timeout ({total_timeout}s)")
             except Exception as e:
                 last_error = str(e)
                 last_error_type = 'Other'
-                logger.info(f"✗ Stream DEAD: '{channel_name}' - Error Type: {last_error_type}, Exception: {last_error}")
 
             # Only do immediate retries if not skipping them and not the last attempt
             if not skip_retries and attempt < max_attempts - 1:
-                logger.info(f"Channel '{channel_name}' stream check failed. Retrying ({attempt+1}/{retries})...")
+                logger.debug(f"Channel '{channel_name}' stream check failed. Retrying ({attempt+1}/{retries})...")
                 time.sleep(1)
 
-        # Log final result if all attempts failed
-        logger.info(f"Final result for '{channel_name}': DEAD - Error Type: {last_error_type}")
+        # Log final result once if stream is dead after all attempts
+        logger.info(f"✗ '{channel_name}' DEAD - {last_error_type}")
 
         default_return['error'] = last_error
         default_return['error_type'] = last_error_type
