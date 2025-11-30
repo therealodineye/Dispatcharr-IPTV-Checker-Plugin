@@ -1,6 +1,6 @@
 # Dispatcharr IPTV Checker Plugin
 
-**Description:** Check IPTV stream status, analyze stream quality, and manage channels based on results
+## Check IPTV stream status, analyze stream quality, and manage channels based on results
 
 [![Dispatcharr plugin](https://img.shields.io/badge/Dispatcharr-plugin-8A2BE2)](https://github.com/Dispatcharr/Dispatcharr)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/PiratesIRC/Dispatcharr-IPTV-Checker-Plugin)
