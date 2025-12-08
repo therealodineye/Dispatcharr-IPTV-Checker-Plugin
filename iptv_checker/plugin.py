@@ -17,6 +17,23 @@ import urllib.error
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Scheduler imports
+try:
+    import pytz
+    PYTZ_AVAILABLE = True
+except ImportError:
+    PYTZ_AVAILABLE = False
+    # Will log warning later when scheduler is attempted to be used
+
+# Django/Dispatcharr imports for metadata updates
+try:
+    from apps.proxy.ts_proxy.services.channel_service import ChannelService
+    from apps.channels.models import Stream
+    DISPATCHARR_INTEGRATION_AVAILABLE = True
+except ImportError:
+    DISPATCHARR_INTEGRATION_AVAILABLE = False
+    LOGGER.warning("Dispatcharr integration not available - metadata updates will be skipped")
+
 # Setup logging with plugin name for Dispatcharr's logging system
 class PluginNameFilter(logging.Filter):
     """Filter that adds [IPTV Checker] prefix to all log messages"""
@@ -29,14 +46,71 @@ LOGGER = logging.getLogger("plugins.iptv_checker")
 LOGGER.setLevel(logging.INFO)
 LOGGER.addFilter(PluginNameFilter())
 
+# --- Scheduler Globals ---
+_bg_scheduler_thread = None
+_scheduler_stop_event = threading.Event()
+_scheduler_pending_run = False  # Flag to queue a run if check already in progress
+
+# --- Scheduler Configuration ---
+class SchedulerConfig:
+    DEFAULT_TIMEZONE = "America/Chicago"
+    SCHEDULER_CHECK_INTERVAL = 30  # Check every 30 seconds
+    SCHEDULER_TIME_WINDOW = 30  # ±30 second window to trigger
+    SCHEDULER_ERROR_WAIT = 60  # Wait 60s if error occurs
+    SCHEDULER_STOP_TIMEOUT = 5  # Max wait for thread to stop
+
 class Plugin:
     """Dispatcharr IPTV Checker Plugin"""
     
     # Explicitly set the plugin key
     key = "iptv_checker"
     name = "IPTV Checker"
-    version = "0.3.1"
+    version = "0.4.0"
     description = "Check stream status and quality for channels in specified Dispatcharr groups."
+
+    @staticmethod
+    def _load_timezones_from_file():
+        """Load timezone list from zone1970.tab file"""
+        try:
+            # Try system location first
+            timezone_file = "/usr/share/zoneinfo/zone1970.tab"
+            if not os.path.exists(timezone_file):
+                # Fall back to plugin directory
+                timezone_file = os.path.join(os.path.dirname(__file__), 'zone1970.tab')
+            
+            timezones = []
+            
+            with open(timezone_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    # Skip comments and empty lines
+                    if line.startswith('#') or not line.strip():
+                        continue
+                    
+                    # Parse the tab-delimited format
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 3:
+                        timezone_name = parts[2]
+                        timezones.append({"label": timezone_name, "value": timezone_name})
+            
+            # Sort alphabetically by timezone name
+            timezones.sort(key=lambda x: x['label'])
+            return timezones
+        
+        except Exception as e:
+            LOGGER.warning(f"Could not load timezones from zone1970.tab: {e}, using fallback list")
+            # Fallback to a minimal list if file cannot be read
+            return [
+                {"label": "America/New_York", "value": "America/New_York"},
+                {"label": "America/Los_Angeles", "value": "America/Los_Angeles"},
+                {"label": "America/Chicago", "value": "America/Chicago"},
+                {"label": "America/Denver", "value": "America/Denver"},
+                {"label": "Europe/London", "value": "Europe/London"},
+                {"label": "Europe/Paris", "value": "Europe/Paris"},
+                {"label": "Europe/Berlin", "value": "Europe/Berlin"},
+                {"label": "Asia/Tokyo", "value": "Asia/Tokyo"},
+                {"label": "Asia/Shanghai", "value": "Asia/Shanghai"},
+                {"label": "Australia/Sydney", "value": "Australia/Sydney"}
+            ]
 
     @property
     def fields(self):
@@ -54,115 +128,160 @@ class Plugin:
                 "type": "info",
                 "help_text": version_message,
             },
-        {
-            "id": "dispatcharr_url",
-            "label": "🌐 Dispatcharr URL",
-            "type": "string",
-            "default": "",
-            "placeholder": "http://192.168.1.10:9191",
-            "help_text": "URL of your Dispatcharr instance (from your browser's address bar). Example: http://127.0.0.1:9191",
-        },
-        {
-            "id": "dispatcharr_username",
-            "label": "👤 Dispatcharr Admin Username",
-            "type": "string",
-            "help_text": "Your admin username for the Dispatcharr UI. Required for WRITE operations.",
-        },
-        {
-            "id": "dispatcharr_password",
-            "label": "🔑 Dispatcharr Admin Password",
-            "type": "string",
-            "input_type": "password",
-            "help_text": "Your admin password for the Dispatcharr UI. Required for WRITE operations.",
-        },
-        {
-            "id": "group_names",
-            "label": "📂 Group(s) to Check (comma-separated)",
-            "type": "string",
-            "default": "",
-            "help_text": "The name of the Dispatcharr Channel Group(s) to check. Leave blank to check all groups.",
-        },
-        {
-            "id": "timeout",
-            "label": "⏱️ Connection Timeout (seconds)",
-            "type": "number",
-            "default": 10,
-            "help_text": "Timeout for each stream connection attempt. Default: 10",
-        },
-        {
-            "id": "dead_connection_retries",
-            "label": "🔄 Dead Connection Retries",
-            "type": "number",
-            "default": 3,
-            "help_text": "Number of times to retry checking a stream if it appears to be dead. Default: 3",
-        },
-        {
-            "id": "dead_rename_format",
-            "label": "💀 Dead Channel Rename Format",
-            "type": "string",
-            "default": "{name} [DEAD]",
-            "placeholder": "[DEAD] {name}",
-            "help_text": "Format for renaming dead channels. Use {name} as placeholder for the original channel name. Examples: '[DEAD] {name}', '{name} [DEAD]', '[X] {name} [DEAD]'",
-        },
-        {
-            "id": "move_to_group_name",
-            "label": "⚰️ Move Dead Channels to Group",
-            "type": "string",
-            "default": "Graveyard",
-            "help_text": "Enter the name for the group to move dead channels into.",
-        },
-        {
-            "id": "low_framerate_rename_format",
-            "label": "🐌 Low Framerate Rename Format - Less than 30fps",
-            "type": "string",
-            "default": "{name} [Slow]",
-            "placeholder": "[SLOW] {name}",
-            "help_text": "Format for renaming low framerate channels. Use {name} as placeholder for the original channel name. Examples: '[SLOW] {name}', '{name} [Slow]'",
-        },
-        {
-            "id": "move_low_framerate_group",
-            "label": "📁 Move Low Framerate Channels to Group",
-            "type": "string",
-            "default": "Slow",
-            "help_text": "Enter the name for the group to move low framerate channels into.",
-        },
-        {
-            "id": "video_format_suffixes",
-            "label": "🎬 Add Video Format Suffixes - [UHD], [FHD], [HD], [SD], [Unknown]",
-            "type": "string",
-            "default": "UHD, FHD, HD, SD, Unknown",
-            "help_text": "A comma-separated list of formats to add as a suffix (e.g., [HD]) to channel names.",
-        },
-        {
-            "id": "enable_parallel_checking",
-            "label": "⚡ Enable Parallel Stream Checking",
-            "type": "boolean",
-            "default": True,
-            "help_text": "Check multiple streams simultaneously for significantly faster processing. Recommended for large channel lists.",
-        },
-        {
-            "id": "parallel_workers",
-            "label": "👷 Number of Parallel Workers",
-            "type": "number",
-            "default": 2,
-            "help_text": "Number of streams to check simultaneously when parallel checking is enabled. Default: 2. Higher values = faster but more resource-intensive.",
-        },
-        {
-            "id": "ffprobe_flags",
-            "label": "🔍 FFprobe Analysis Flags",
-            "type": "string",
-            "default": "-show_streams",
-            "placeholder": "-show_streams, -show_frames, -show_packets",
-            "help_text": "Comma-separated ffprobe flags for stream analysis. Options: -show_streams (basic validation), -show_frames (GOP/timestamps), -show_packets (bitrate), -loglevel error (errors only). Default: -show_streams",
-        },
-        {
-            "id": "ffprobe_analysis_duration",
-            "label": "⏱️ FFprobe Analysis Duration (seconds)",
-            "type": "number",
-            "default": 5,
-            "help_text": "Duration to analyze stream when using -show_frames or -show_packets. Longer duration = more accurate bitrate/GOP analysis but slower checks. Default: 5 seconds",
-        }
-    ]
+            {
+                "id": "dispatcharr_url",
+                "label": "🌐 Dispatcharr URL",
+                "type": "string",
+                "default": "",
+                "placeholder": "http://192.168.1.10:9191",
+                "help_text": "URL of your Dispatcharr instance (from your browser's address bar). Example: http://127.0.0.1:9191",
+            },
+            {
+                "id": "dispatcharr_username",
+                "label": "👤 Dispatcharr Admin Username",
+                "type": "string",
+                "help_text": "Your admin username for the Dispatcharr UI. Required for WRITE operations.",
+            },
+            {
+                "id": "dispatcharr_password",
+                "label": "🔑 Dispatcharr Admin Password",
+                "type": "string",
+                "input_type": "password",
+                "help_text": "Your admin password for the Dispatcharr UI. Required for WRITE operations.",
+            },
+            {
+                "id": "group_names",
+                "label": "📂 Group(s) to Check (comma-separated)",
+                "type": "string",
+                "default": "",
+                "help_text": "The name of the Dispatcharr Channel Group(s) to check. Leave blank to check all groups.",
+            },
+            {
+                "id": "check_alternative_streams",
+                "label": "🔄 Check Alternative Streams",
+                "type": "boolean",
+                "default": True,
+                "help_text": "Check all alternative/backup streams for each channel in addition to the primary stream. This will significantly increase check time.",
+            },
+            {
+                "id": "timeout",
+                "label": "⏱️ Connection Timeout (seconds)",
+                "type": "number",
+                "default": 10,
+                "help_text": "Timeout for each stream connection attempt. Default: 10",
+            },
+            {
+                "id": "dead_connection_retries",
+                "label": "🔄 Dead Connection Retries",
+                "type": "number",
+                "default": 3,
+                "help_text": "Number of times to retry checking a stream if it appears to be dead. Default: 3",
+            },
+            {
+                "id": "dead_rename_format",
+                "label": "💀 Dead Channel Rename Format",
+                "type": "string",
+                "default": "{name} [DEAD]",
+                "placeholder": "[DEAD] {name}",
+                "help_text": "Format for renaming dead channels. Use {name} as placeholder for the original channel name. Examples: '[DEAD] {name}', '{name} [DEAD]', '[X] {name} [DEAD]'",
+            },
+            {
+                "id": "move_to_group_name",
+                "label": "⚰️ Move Dead Channels to Group",
+                "type": "string",
+                "default": "Graveyard",
+                "help_text": "Enter the name for the group to move dead channels into.",
+            },
+            {
+                "id": "low_framerate_rename_format",
+                "label": "🐌 Low Framerate Rename Format - Less than 30fps",
+                "type": "string",
+                "default": "{name} [Slow]",
+                "placeholder": "[SLOW] {name}",
+                "help_text": "Format for renaming low framerate channels. Use {name} as placeholder for the original channel name. Examples: '[SLOW] {name}', '{name} [Slow]'",
+            },
+            {
+                "id": "move_low_framerate_group",
+                "label": "📁 Move Low Framerate Channels to Group",
+                "type": "string",
+                "default": "Slow",
+                "help_text": "Enter the name for the group to move low framerate channels into.",
+            },
+            {
+                "id": "video_format_suffixes",
+                "label": "🎬 Add Video Format Suffixes - [UHD], [FHD], [HD], [SD], [Unknown]",
+                "type": "string",
+                "default": "UHD, FHD, HD, SD, Unknown",
+                "help_text": "A comma-separated list of formats to add as a suffix (e.g., [HD]) to channel names.",
+            },
+            {
+                "id": "enable_parallel_checking",
+                "label": "⚡ Enable Parallel Stream Checking",
+                "type": "boolean",
+                "default": True,
+                "help_text": "Check multiple streams simultaneously for significantly faster processing. Recommended for large channel lists.",
+            },
+            {
+                "id": "parallel_workers",
+                "label": "👷 Number of Parallel Workers",
+                "type": "number",
+                "default": 2,
+                "help_text": "Number of streams to check simultaneously when parallel checking is enabled. Default: 2. Higher values = faster but more resource-intensive.",
+            },
+            {
+                "id": "ffprobe_flags",
+                "label": "🔍 FFprobe Analysis Flags",
+                "type": "string",
+                "default": "-show_streams,-show_frames,-show_packets,-loglevel error",
+                "placeholder": "-show_streams, -show_frames, -show_packets",
+                "help_text": "Comma-separated ffprobe flags for stream analysis. Options: -show_streams (basic validation), -show_frames (GOP/timestamps), -show_packets (bitrate), -loglevel error (errors only). Default: -show_streams,-show_frames,-show_packets,-loglevel error",
+            },
+            {
+                "id": "ffprobe_analysis_duration",
+                "label": "⏱️ FFprobe Analysis Duration (seconds)",
+                "type": "number",
+                "default": 5,
+                "help_text": "Duration to analyze stream when using -show_frames or -show_packets. Longer duration = more accurate bitrate/GOP analysis but slower checks. Default: 5 seconds",
+            },
+            {
+                "id": "ffprobe_path",
+                "label": "📍 FFprobe Path",
+                "type": "string",
+                "default": "/usr/local/bin/ffprobe",
+                "placeholder": "/usr/local/bin/ffprobe",
+                "help_text": "Full path to the ffprobe executable. Default: /usr/local/bin/ffprobe (Dispatcharr's default location)",
+            },
+            {
+                "id": "enable_scheduler",
+                "label": "🕐 Enable Scheduled Checks",
+                "type": "boolean",
+                "default": False,
+                "help_text": "Enable automatic scheduled stream checks. Requires configured schedule times and timezone.",
+            },
+            {
+                "id": "scheduled_times",
+                "label": "⏰ Scheduled Check Times (Cron Format)",
+                "type": "string",
+                "default": "",
+                "placeholder": "0 4 * * *,0 3 1 * *",
+                "help_text": "Comma-separated cron expressions. Format: 'minute hour day month weekday' (weekday: 0=Sunday, 6=Saturday). Examples: '0 4 * * *' (daily at 4 AM), '0 3 * * 0' (Sundays at 3 AM), '0 2 */2 * *' (every 2 days at 2 AM), '0 4 1 * *' (1st of month at 4 AM), '0 4 * * 1-5' (weekdays at 4 AM), '0 4 * * *,0 16 * * *' (4 AM and 4 PM daily). Leave blank to disable scheduling.",
+            },
+            {
+                "id": "scheduler_timezone",
+                "label": "🌍 Scheduler Timezone",
+                "type": "select",
+                "default": "America/Chicago",
+                "options": self._load_timezones_from_file(),
+                "help_text": "Timezone for scheduled checks. All IANA timezone names are supported.",
+            },
+            {
+                "id": "scheduler_export_csv",
+                "label": "💾 Export CSV for Scheduled Checks",
+                "type": "boolean",
+                "default": False,
+                "help_text": "Automatically export results to CSV after scheduled checks complete.",
+            }
+        ]
 
     actions = [
         {
@@ -240,6 +359,11 @@ class Plugin:
             "label": "🗑️ Clear CSV Exports",
             "description": "Delete all CSV export files created by this plugin.",
             "confirm": { "required": True, "title": "Clear All CSV Exports?", "message": "This will delete all CSV files in /data/exports/. This action cannot be undone. Continue?" }
+        },
+        {
+            "id": "update_schedule",
+            "label": "📅 Update Schedule",
+            "description": "Apply the current schedule settings. If scheduled times are empty, the schedule will be cleared and scheduler will be stopped.",
         }
     ]
     
@@ -247,7 +371,9 @@ class Plugin:
         self.results_file = "/data/iptv_checker_results.json"
         self.loaded_channels_file = "/data/iptv_checker_loaded_channels.json"
         self.progress_file = "/data/iptv_checker_progress.json"
+        self.settings_file = "/data/iptv_checker_settings.json"
         self.check_progress = self._load_progress()
+        self.load_progress = {"current": 0, "total": 0, "status": "idle"}  # Track load groups progress
         self.check_lock = threading.Lock()  # Lock to prevent duplicate checks
         self.status_thread = None
         self.stop_status_updates = False
@@ -279,6 +405,313 @@ class Plugin:
                 json.dump(self.check_progress, f)
         except Exception as e:
             LOGGER.error(f"Failed to save progress file: {e}")
+
+    def on_load(self, context):
+        """Called when plugin is loaded or reloaded."""
+        LOGGER.info("Plugin loaded - initializing scheduler")
+        settings = self._load_settings()
+        if settings:
+            self._start_background_scheduler(settings)
+        else:
+            LOGGER.info("No saved settings found - scheduler not started")
+    
+    def on_unload(self):
+        """Called when plugin is unloaded or disabled."""
+        LOGGER.info("Plugin unloading - stopping scheduler")
+        self._stop_background_scheduler()
+    
+    def _load_settings(self):
+        """Load settings from persistent storage."""
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                LOGGER.error(f"Failed to load settings file: {e}")
+        return None
+    
+    def _save_settings(self, settings):
+        """Save settings to persistent storage."""
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            LOGGER.debug("Settings saved successfully")
+        except Exception as e:
+            LOGGER.error(f"Failed to save settings file: {e}")
+    
+    def _parse_scheduled_times(self, scheduled_times_str):
+        """
+        Parse comma-separated cron expressions.
+        Format: 'minute hour day month weekday'
+        Example: "0 4 * * *" = daily at 4:00 AM
+        Example: "0 3 1 * *" = 1st of month at 3:00 AM
+        Returns list of cron expression strings.
+        """
+        if not scheduled_times_str or not scheduled_times_str.strip():
+            return []
+        
+        cron_expressions = []
+        for expr in scheduled_times_str.split(','):
+            expr = expr.strip()
+            if expr:
+                # Validate basic cron format (5 fields)
+                parts = expr.split()
+                if len(parts) == 5:
+                    cron_expressions.append(expr)
+                else:
+                    LOGGER.warning(f"Invalid cron expression (must have 5 fields): {expr}")
+        
+        return cron_expressions
+
+    def _cron_matches(self, cron_expr, dt):
+        """
+        Check if a cron expression matches the given datetime.
+        Format: 'minute hour day month weekday'
+        Supports: specific values, *, */n (step values), and ranges (not implemented for simplicity)
+        """
+        try:
+            parts = cron_expr.split()
+            if len(parts) != 5:
+                return False
+            
+            minute_expr, hour_expr, day_expr, month_expr, weekday_expr = parts
+            
+            # Check minute (0-59)
+            if not self._cron_field_matches(minute_expr, dt.minute, 0, 59):
+                return False
+            
+            # Check hour (0-23)
+            if not self._cron_field_matches(hour_expr, dt.hour, 0, 23):
+                return False
+            
+            # Check day of month (1-31)
+            if not self._cron_field_matches(day_expr, dt.day, 1, 31):
+                return False
+            
+            # Check month (1-12)
+            if not self._cron_field_matches(month_expr, dt.month, 1, 12):
+                return False
+            
+            # Check day of week (0-6, Sunday=0)
+            # Python's weekday() returns 0=Monday, so convert: (weekday + 1) % 7
+            python_weekday = dt.weekday()
+            cron_weekday = (python_weekday + 1) % 7
+            if not self._cron_field_matches(weekday_expr, cron_weekday, 0, 6):
+                return False
+            
+            return True
+        except Exception as e:
+            LOGGER.error(f"Error matching cron expression '{cron_expr}': {e}")
+            return False
+    
+    def _cron_field_matches(self, field_expr, current_value, min_val, max_val):
+        """
+        Check if a single cron field matches the current value.
+        Supports: *, specific number, */n (step), ranges (1-5), lists (1,3,5)
+        """
+        field_expr = field_expr.strip()
+        
+        # Wildcard - matches anything
+        if field_expr == '*':
+            return True
+        
+        # Step values (e.g., */2 for every 2 units)
+        if field_expr.startswith('*/'):
+            try:
+                step = int(field_expr[2:])
+                return current_value % step == 0
+            except ValueError:
+                return False
+        
+        # Lists (e.g., 1,3,5)
+        if ',' in field_expr:
+            try:
+                values = [int(v.strip()) for v in field_expr.split(',')]
+                return current_value in values
+            except ValueError:
+                return False
+        
+        # Ranges (e.g., 1-5)
+        if '-' in field_expr:
+            try:
+                start, end = field_expr.split('-')
+                start_val = int(start.strip())
+                end_val = int(end.strip())
+                return start_val <= current_value <= end_val
+            except (ValueError, IndexError):
+                return False
+        
+        # Specific value
+        try:
+            target_value = int(field_expr)
+            return current_value == target_value
+        except ValueError:
+            return False
+    
+    def _start_background_scheduler(self, settings):
+        """Start the background scheduler thread."""
+        global _bg_scheduler_thread, _scheduler_pending_run
+        
+        # Check if scheduling is enabled
+        if not settings.get("enable_scheduler", False):
+            LOGGER.debug("Scheduler is disabled in settings")
+            return
+        
+        # Check if pytz is available
+        if not PYTZ_AVAILABLE:
+            LOGGER.error("Scheduler requires pytz library but it is not installed")
+            return
+        
+        # Stop any existing scheduler first
+        self._stop_background_scheduler()
+        
+        # Get and validate schedule configuration
+        scheduled_times_str = settings.get("scheduled_times", "")
+        if not scheduled_times_str:
+            LOGGER.warning("Scheduler enabled but no scheduled times configured")
+            return
+        
+        scheduled_times = self._parse_scheduled_times(scheduled_times_str)
+        if not scheduled_times:
+            LOGGER.error(f"Invalid scheduled times format: {scheduled_times_str}")
+            return
+        
+        # Get timezone
+        tz_str = settings.get('scheduler_timezone', SchedulerConfig.DEFAULT_TIMEZONE)
+        try:
+            local_tz = pytz.timezone(tz_str)
+        except pytz.exceptions.UnknownTimeZoneError:
+            LOGGER.error(f"Unknown timezone: {tz_str}, using default: {SchedulerConfig.DEFAULT_TIMEZONE}")
+            tz_str = SchedulerConfig.DEFAULT_TIMEZONE
+            local_tz = pytz.timezone(tz_str)
+        
+        # Define the scheduler loop
+        def scheduler_loop():
+            global _scheduler_pending_run
+            nonlocal local_tz
+            last_run = {}  # Track last run timestamp for each cron expression (to minute precision)
+            
+            LOGGER.info(f"Scheduler started. Timezone: {tz_str}, Cron expressions: {scheduled_times}")
+            
+            while not _scheduler_stop_event.is_set():
+                try:
+                    now = datetime.now(local_tz)
+                    # Truncate to minute precision for matching (ignore seconds)
+                    current_minute = now.replace(second=0, microsecond=0)
+                    
+                    for cron_expr in scheduled_times:
+                        # Check if this cron expression matches the current time
+                        if self._cron_matches(cron_expr, now):
+                            # Check if we already ran this minute
+                            if last_run.get(cron_expr) == current_minute:
+                                continue  # Already ran this minute
+                            
+                            LOGGER.info(f"⏰ SCHEDULED RUN triggered at {now.strftime('%Y-%m-%d %H:%M:%S')} for cron: {cron_expr}")
+                            
+                            # Mark as run for this minute immediately to prevent duplicate triggers
+                            last_run[cron_expr] = current_minute
+                            
+                            # Check if a check is already running
+                            if self.check_progress.get('status') == 'running':
+                                LOGGER.warning("Scheduled run triggered but a check is already running - queuing for later")
+                                _scheduler_pending_run = True
+                            else:
+                                # Execute scheduled task
+                                try:
+                                    self._execute_scheduled_check(settings)
+                                except Exception as e:
+                                    LOGGER.error(f"Scheduled check failed: {e}", exc_info=True)
+                            
+                            break  # Only trigger one schedule per check cycle
+                    
+                    # Check if there's a pending run and no check is currently running
+                    if _scheduler_pending_run and self.check_progress.get('status') != 'running':
+                        LOGGER.info("⏰ Executing queued scheduled run")
+                        _scheduler_pending_run = False
+                        try:
+                            self._execute_scheduled_check(settings)
+                        except Exception as e:
+                            LOGGER.error(f"Queued scheduled check failed: {e}", exc_info=True)
+                    
+                    # Sleep efficiently
+                    _scheduler_stop_event.wait(SchedulerConfig.SCHEDULER_CHECK_INTERVAL)
+                
+                except Exception as e:
+                    LOGGER.error(f"Scheduler loop error: {e}", exc_info=True)
+                    _scheduler_stop_event.wait(SchedulerConfig.SCHEDULER_ERROR_WAIT)
+            
+            LOGGER.info("Scheduler stopped")
+        
+        # Start the scheduler thread
+        _bg_scheduler_thread = threading.Thread(
+            target=scheduler_loop,
+            name="iptv-checker-scheduler",
+            daemon=True
+        )
+        _bg_scheduler_thread.start()
+        LOGGER.info("Background scheduler thread started")
+    
+    def _stop_background_scheduler(self):
+        """Cleanly stop the background scheduler thread."""
+        global _bg_scheduler_thread, _scheduler_pending_run
+        
+        if _bg_scheduler_thread and _bg_scheduler_thread.is_alive():
+            LOGGER.info("Stopping scheduler thread...")
+            _scheduler_stop_event.set()
+            _bg_scheduler_thread.join(timeout=SchedulerConfig.SCHEDULER_STOP_TIMEOUT)
+            _scheduler_stop_event.clear()
+            _scheduler_pending_run = False
+            _bg_scheduler_thread = None
+            LOGGER.info("Scheduler thread stopped")
+    
+    def _execute_scheduled_check(self, settings):
+        """Execute the scheduled stream check (Load Groups + Start Check)."""
+        LOGGER.info("⏰ Starting scheduled check sequence")
+        
+        # Create a logger context for scheduled runs
+        scheduled_logger = logging.getLogger("plugins.iptv_checker.scheduled")
+        scheduled_logger.setLevel(logging.INFO)
+        if not any(isinstance(f, PluginNameFilter) for f in scheduled_logger.filters):
+            scheduled_logger.addFilter(PluginNameFilter())
+        
+        try:
+            # Step 1: Load Groups
+            LOGGER.info("⏰ SCHEDULED: Loading groups...")
+            load_result = self.load_groups_action(settings, scheduled_logger)
+            
+            if load_result.get('status') != 'success':
+                LOGGER.error(f"⏰ SCHEDULED: Load groups failed: {load_result.get('message')}")
+                return
+            
+            LOGGER.info(f"⏰ SCHEDULED: {load_result.get('message')}")
+            
+            # Step 2: Start Stream Check
+            LOGGER.info("⏰ SCHEDULED: Starting stream check...")
+            check_result = self.check_streams_action(settings, scheduled_logger, context={'scheduled': True})
+            
+            if check_result.get('status') != 'success':
+                LOGGER.error(f"⏰ SCHEDULED: Stream check failed to start: {check_result.get('message')}")
+                return
+            
+            LOGGER.info(f"⏰ SCHEDULED: {check_result.get('message')}")
+            
+            # Wait for check to complete
+            LOGGER.info("⏰ SCHEDULED: Waiting for stream check to complete...")
+            while self.check_progress.get('status') == 'running':
+                time.sleep(5)
+            
+            LOGGER.info("⏰ SCHEDULED: Stream check completed")
+            
+            # Step 3: Export CSV if enabled
+            if settings.get('scheduler_export_csv', False):
+                LOGGER.info("⏰ SCHEDULED: Exporting results to CSV...")
+                export_result = self.export_results_action(settings, scheduled_logger)
+                LOGGER.info(f"⏰ SCHEDULED: {export_result.get('message')}")
+            
+            LOGGER.info("⏰ SCHEDULED: Check sequence completed successfully")
+            
+        except Exception as e:
+            LOGGER.error(f"⏰ SCHEDULED: Error during scheduled check: {e}", exc_info=True)
 
     def _get_latest_version(self, owner="PiratesIRC", repo="Dispatcharr-IPTV-Checker-Plugin"):
         """
@@ -373,11 +806,18 @@ class Plugin:
     def run(self, action, params, context):
         """Main plugin entry point"""
         LOGGER.info(f"Run called with action: {action}")
-        LOGGER.info(f"Plugin key from context: {context.get('plugin_key', 'unknown')}")  # Debug line
 
         try:
             settings = context.get("settings", {})
             logger = context.get("logger", LOGGER)
+            
+            # Save settings and restart scheduler on every run to pick up changes
+            self._save_settings(settings)
+            
+            # Restart scheduler if scheduling settings may have changed
+            # Skip if action is status update to avoid overhead
+            if action not in ["get_status_update"]:
+                self._start_background_scheduler(settings)
 
             # Add our filter to context logger to ensure all logs are prefixed
             if logger is not LOGGER and not any(isinstance(f, PluginNameFilter) for f in logger.filters):
@@ -398,6 +838,7 @@ class Plugin:
                 "view_table": self.view_table_action,
                 "export_results": self.export_results_action,
                 "clear_csv_exports": self.clear_csv_exports_action,
+                "update_schedule": self.update_schedule_action,
             }
 
             if action not in action_map:
@@ -560,6 +1001,29 @@ class Plugin:
             validation_results.append(f"⚠️ Analysis duration must be > 0 (current: {analysis_duration})")
             has_errors = True
 
+        # Validate scheduler settings if configured
+        scheduled_times_str = settings.get("scheduled_times", "").strip()
+        if scheduled_times_str:
+            scheduled_times = self._parse_scheduled_times(scheduled_times_str)
+            if not scheduled_times:
+                validation_results.append(f"❌ Invalid cron expression(s): '{scheduled_times_str}'")
+                validation_results.append("   Format: 'minute hour day month weekday' (e.g., '0 4 * * *')")
+                has_errors = True
+            else:
+                validation_results.append(f"✅ Cron schedule(s) valid: {', '.join(scheduled_times)}")
+                
+            # Validate timezone
+            scheduler_timezone = settings.get("scheduler_timezone", SchedulerConfig.DEFAULT_TIMEZONE)
+            if PYTZ_AVAILABLE:
+                try:
+                    pytz.timezone(scheduler_timezone)
+                    validation_results.append(f"✅ Timezone valid: {scheduler_timezone}")
+                except pytz.exceptions.UnknownTimeZoneError:
+                    validation_results.append(f"❌ Unknown timezone: {scheduler_timezone}")
+                    has_errors = True
+            else:
+                validation_results.append("⚠️ pytz not available - scheduler timezone cannot be validated")
+
         # Return results
         status = "error" if has_errors else "success"
         message = "\n".join(validation_results)
@@ -572,9 +1036,34 @@ class Plugin:
         return {"status": status, "message": message}
 
     def view_progress_action(self, settings, logger):
-        """View the current progress of a running stream check."""
+        """View the current progress of a running operation (load groups or stream check)."""
+        
+        # Check if loading groups is in progress
+        if self.load_progress.get('status') == 'loading':
+            current, total = self.load_progress['current'], self.load_progress['total']
+            percent = (current / total * 100) if total > 0 else 0
+
+            # Calculate ETA
+            if self.load_progress.get('start_time') and current > 0:
+                elapsed_seconds = time.time() - self.load_progress['start_time']
+                avg_time_per_channel = elapsed_seconds / current
+                remaining_channels = total - current
+                eta_seconds = remaining_channels * avg_time_per_channel
+                eta_minutes = eta_seconds / 60
+
+                if eta_minutes < 1:
+                    eta_str = f"ETA: <1 min"
+                else:
+                    eta_str = f"ETA: {eta_minutes:.0f} min"
+            else:
+                eta_str = "ETA: calculating..."
+
+            message = f"📥 Loading channels {current}/{total} - {percent:.0f}% complete | {eta_str}"
+            return {"status": "success", "message": message}
+        
+        # Check if stream check is in progress
         if self.check_progress['status'] != 'running':
-            return {"status": "info", "message": "No stream check is currently running.\n\nUse '▶️ Start Stream Check' to begin checking streams."}
+            return {"status": "info", "message": "No operation is currently running.\n\nUse '📥 Load Group(s)' to load channels or '▶️ Start Stream Check' to begin checking streams."}
 
         current, total = self.check_progress['current'], self.check_progress['total']
         percent = (current / total * 100) if total > 0 else 0
@@ -760,45 +1249,153 @@ class Plugin:
                 if not target_group_ids: return {"status": "error", "message": f"None of the specified groups could be found: {', '.join(invalid_names)}"}
 
             all_channels = self._get_api_data("/api/channels/channels/", token, settings)
-            loaded_channels = []
-            for channel in all_channels:
-                if channel.get('channel_group_id') in target_group_ids:
-                    logger.info(f"Fetching streams for channel: {channel.get('name')}")
-                    channel_streams = self._get_api_data(f"/api/channels/channels/{channel['id']}/streams/", token, settings)
-                    loaded_channels.append({**channel, "streams": channel_streams})
+            channels_in_groups = [ch for ch in all_channels if ch.get('channel_group_id') in target_group_ids]
             
-            with open(self.loaded_channels_file, 'w') as f: json.dump(loaded_channels, f)
-
-            total_streams = sum(len(c.get('streams', [])) for c in loaded_channels)
+            # For small channel counts (<100), load synchronously
+            if len(channels_in_groups) < 100:
+                return self._load_groups_sync(channels_in_groups, settings, logger, group_names_str, target_group_names)
+            
+            # For large channel counts, load in background
+            logger.info(f"Loading {len(channels_in_groups)} channels in background to avoid timeout...")
+            
+            # Initialize progress
+            self.load_progress = {
+                "current": 0,
+                "total": len(channels_in_groups),
+                "status": "loading",
+                "start_time": time.time()
+            }
+            
+            # Start background loading
+            loading_thread = threading.Thread(
+                target=self._load_groups_background,
+                args=(channels_in_groups, settings, logger, group_names_str, target_group_names, token)
+            )
+            loading_thread.daemon = True
+            loading_thread.start()
+            
             group_msg = "all groups" if not group_names_str else f"group(s): {', '.join(target_group_names)}"
+            return {
+                "status": "success", 
+                "message": f"⏳ Loading {len(channels_in_groups)} channels from {group_msg} in background...\n\nThis may take a few minutes. You can close this dialog and check back later.\n\nOnce complete, use '▶️ Start Stream Check' to begin checking."
+            }
+            
+        except Exception as e: 
+            return {"status": "error", "message": str(e)}
 
-            timeout = settings.get("timeout", 10)
-            retries = settings.get("dead_connection_retries", 3)
-            parallel_enabled = settings.get("enable_parallel_checking", False)
-            parallel_workers = settings.get("parallel_workers", 2)
+    def _load_groups_sync(self, channels_in_groups, settings, logger, group_names_str, target_group_names):
+        """Synchronously load groups (for small channel counts)"""
+        check_alternative_streams = settings.get("check_alternative_streams", True)
+        token, _ = self._get_api_token(settings, logger)
+        loaded_channels = []
+        
+        for channel in channels_in_groups:
+            logger.info(f"Fetching streams for channel: {channel.get('name')}")
+            channel_streams = self._get_api_data(f"/api/channels/channels/{channel['id']}/streams/", token, settings)
+            
+            # Log detailed stream information
+            if check_alternative_streams and channel_streams:
+                logger.info(f"  Channel '{channel.get('name')}' has {len(channel_streams)} stream(s)")
+                for stream in channel_streams:
+                    order = stream.get('channelstream', {}).get('order', 'unknown')
+                    stream_type = "PRIMARY" if order == 0 else f"BACKUP #{order}"
+                    logger.info(f"    - {stream_type}: {stream.get('name', 'Unnamed')} (ID: {stream.get('id')})")
+            elif channel_streams:
+                logger.info(f"  Channel '{channel.get('name')}' has {len(channel_streams)} stream(s) (primary only)")
+            
+            # Filter to only primary stream if alternative streams check is disabled
+            if not check_alternative_streams and channel_streams:
+                channel_streams = [s for s in channel_streams if s.get('channelstream', {}).get('order') == 0]
+            
+            loaded_channels.append({**channel, "streams": channel_streams})
+        
+        with open(self.loaded_channels_file, 'w') as f: 
+            json.dump(loaded_channels, f)
 
-            # Estimate time based on mode
-            if parallel_enabled:
-                # Parallel mode: divide by workers, account for overhead
-                estimated_seconds = (total_streams / parallel_workers) * 8.5 * 1.1  # 10% overhead
-                mode_info = f" (parallel mode with {parallel_workers} workers)"
-            else:
-                # Sequential mode: ~8-10 seconds average per stream + 20% buffer
-                estimated_seconds = total_streams * 8.5 * 1.2  # 20% extra time
-                mode_info = " (sequential mode)"
+        return self._build_load_success_message(loaded_channels, settings, group_names_str, target_group_names)
+    
+    def _load_groups_background(self, channels_in_groups, settings, logger, group_names_str, target_group_names, token):
+        """Background loading for large channel counts"""
+        try:
+            check_alternative_streams = settings.get("check_alternative_streams", True)
+            loaded_channels = []
+            
+            # Initialize progress tracking
+            self.load_progress = {
+                "current": 0,
+                "total": len(channels_in_groups),
+                "status": "loading",
+                "start_time": time.time()
+            }
+            
+            logger.info(f"Background loading started for {len(channels_in_groups)} channels")
+            
+            for i, channel in enumerate(channels_in_groups, 1):
+                # Update progress
+                self.load_progress["current"] = i
+                
+                if i % 100 == 0:
+                    logger.info(f"Progress: Loaded {i}/{len(channels_in_groups)} channels...")
+                
+                try:
+                    channel_streams = self._get_api_data(f"/api/channels/channels/{channel['id']}/streams/", token, settings)
+                    
+                    # Filter to only primary stream if alternative streams check is disabled
+                    if not check_alternative_streams and channel_streams:
+                        channel_streams = [s for s in channel_streams if s.get('channelstream', {}).get('order') == 0]
+                    
+                    loaded_channels.append({**channel, "streams": channel_streams})
+                except Exception as e:
+                    logger.error(f"Failed to load streams for channel {channel.get('name')}: {e}")
+                    # Add channel without streams
+                    loaded_channels.append({**channel, "streams": []})
+            
+            with open(self.loaded_channels_file, 'w') as f: 
+                json.dump(loaded_channels, f)
+            
+            total_streams = sum(len(c.get('streams', [])) for c in loaded_channels)
+            
+            # Mark as complete
+            self.load_progress["status"] = "idle"
+            self.load_progress["end_time"] = time.time()
+            
+            logger.info(f"✅ Background loading completed: {len(loaded_channels)} channels with {total_streams} streams")
+            
+            # Set completion message
+            self.completion_message = f"✅ Loading completed: {len(loaded_channels)} channels with {total_streams} streams loaded.\n\nReady to start stream check."
+            
+        except Exception as e:
+            self.load_progress["status"] = "idle"
+            logger.error(f"Error during background loading: {e}", exc_info=True)
+    
+    def _build_load_success_message(self, loaded_channels, settings, group_names_str, target_group_names):
+        """Build success message for load groups action"""
+        total_streams = sum(len(c.get('streams', [])) for c in loaded_channels)
+        group_msg = "all groups" if not group_names_str else f"group(s): {', '.join(target_group_names)}"
+        
+        parallel_enabled = settings.get("enable_parallel_checking", False)
+        parallel_workers = settings.get("parallel_workers", 2)
+        check_alternative_streams = settings.get("check_alternative_streams", True)
 
-            estimated_minutes = estimated_seconds / 60
+        # Estimate time based on mode
+        if parallel_enabled:
+            estimated_seconds = (total_streams / parallel_workers) * 8.5 * 1.1  # 10% overhead
+            mode_info = f" (parallel mode with {parallel_workers} workers)"
+        else:
+            estimated_seconds = total_streams * 8.5 * 1.2  # 20% extra time
+            mode_info = " (sequential mode)"
 
-            message = f"Successfully loaded {len(loaded_channels)} channels with {total_streams} streams from {group_msg}."
-            if 'invalid_names' in locals() and invalid_names:
-                message += f"\n\nWarning: Ignored groups not found: {', '.join(invalid_names)}"
-            if total_streams > 0:
-                message += f"\n\nNext, click '▶️ Start Stream Check'. Estimated time{mode_info}: {estimated_minutes:.0f} minutes."
-                if not parallel_enabled and total_streams > 50:
-                    message += f"\n\nTip: Enable 'Parallel Stream Checking' in settings to speed up processing significantly!"
+        estimated_minutes = estimated_seconds / 60
+        stream_type_msg = "streams (including alternatives)" if check_alternative_streams else "streams (primary only)"
+        
+        message = f"Successfully loaded {len(loaded_channels)} channels with {total_streams} {stream_type_msg} from {group_msg}."
+        
+        if total_streams > 0:
+            message += f"\n\nNext, click '▶️ Start Stream Check'. Estimated time{mode_info}: {estimated_minutes:.0f} minutes."
+            if not parallel_enabled and total_streams > 50:
+                message += f"\n\nTip: Enable 'Parallel Stream Checking' in settings to speed up processing significantly!"
 
-            return {"status": "success", "message": message}
-        except Exception as e: return {"status": "error", "message": str(e)}
+        return {"status": "success", "message": message}
 
     def check_streams_action(self, settings, logger, context=None):
         """Check status and format of all loaded streams with auto status updates."""
@@ -873,6 +1470,17 @@ class Plugin:
         retries = settings.get("dead_connection_retries", 3)
         self.timeout_retry_queue = []
         streams_processed_since_retry = 0
+        
+        # Load channel data for metadata updates
+        channel_map = {}
+        try:
+            if os.path.exists(self.loaded_channels_file):
+                with open(self.loaded_channels_file, 'r') as f:
+                    loaded_channels = json.load(f)
+                    for channel in loaded_channels:
+                        channel_map[channel.get('id')] = channel
+        except Exception as e:
+            logger.warning(f"Could not load channel data for metadata updates: {e}")
 
         try:
             for i, stream_data in enumerate(all_streams):
@@ -885,10 +1493,26 @@ class Plugin:
                 # Check stream - NO immediate retries, we'll handle them in the background queue
                 result = self.check_stream(stream_data, timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=0)
 
-                # If stream timed out and we have retries enabled, add to retry queue
-                if result.get('error_type') == 'Timeout' and retries > 0:
+                # Update Dispatcharr metadata if available
+                if result.get('dispatcharr_metadata'):
+                    channel_data = channel_map.get(stream_data.get('channel_id'))
+                    if channel_data:
+                        update_success = self._update_dispatcharr_metadata(
+                            channel_data,
+                            stream_data.get('stream_id'),
+                            result['dispatcharr_metadata'],
+                            logger
+                        )
+                        result['metadata_updated'] = update_success
+                    else:
+                        logger.debug(f"Channel data not found for metadata update: channel_id={stream_data.get('channel_id')}")
+                        result['metadata_updated'] = False
+
+                # If stream has a retryable error and retries are enabled, add to retry queue
+                retryable_errors = ['Timeout', 'Connection Refused', 'Network Unreachable', 'Stream Unreachable', 'Server Error']
+                if result.get('error_type') in retryable_errors and retries > 0:
                     self.timeout_retry_queue.append({**stream_data, "retry_count": 0})
-                    logger.info(f"Added '{stream_data.get('channel_name')}' to retry queue due to timeout")
+                    logger.info(f"Added '{stream_data.get('channel_name')}' to retry queue due to {result.get('error_type')}")
 
                 results.append({**stream_data, **result})
                 streams_processed_since_retry += 1
@@ -902,6 +1526,18 @@ class Plugin:
                         logger.info(f"Retrying timeout stream: '{retry_stream.get('channel_name')}' (attempt {retry_stream['retry_count']}/{retries})")
                         retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=retry_stream["retry_count"])  # No immediate retries
 
+                        # Update Dispatcharr metadata if retry succeeded
+                        if retry_result.get('dispatcharr_metadata'):
+                            channel_data = channel_map.get(retry_stream.get('channel_id'))
+                            if channel_data:
+                                update_success = self._update_dispatcharr_metadata(
+                                    channel_data,
+                                    retry_stream.get('stream_id'),
+                                    retry_result['dispatcharr_metadata'],
+                                    logger
+                                )
+                                retry_result['metadata_updated'] = update_success
+
                         # Update the original result in the results list
                         for j, existing_result in enumerate(results):
                             if (existing_result.get('channel_id') == retry_stream.get('channel_id') and
@@ -909,9 +1545,10 @@ class Plugin:
                                 results[j] = {**retry_stream, **retry_result}
                                 break
 
-                        # If still timing out, add back to queue for another retry
-                        if retry_result.get('error_type') == 'Timeout' and retry_stream["retry_count"] < retries:
+                        # If still has retryable error, add back to queue for another retry
+                        if retry_result.get('error_type') in retryable_errors and retry_stream["retry_count"] < retries:
                             self.timeout_retry_queue.append(retry_stream)
+                            logger.debug(f"Stream '{retry_stream.get('channel_name')}' still has {retry_result.get('error_type')} error, will retry again")
 
                     streams_processed_since_retry = 0
 
@@ -925,6 +1562,18 @@ class Plugin:
                     retry_stream["retry_count"] += 1
                     logger.info(f"Final retry for timeout stream: '{retry_stream.get('channel_name')}' (attempt {retry_stream['retry_count']}/{retries})")
                     retry_result = self.check_stream(retry_stream, timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=retry_stream["retry_count"])
+
+                    # Update Dispatcharr metadata if final retry succeeded
+                    if retry_result.get('dispatcharr_metadata'):
+                        channel_data = channel_map.get(retry_stream.get('channel_id'))
+                        if channel_data:
+                            update_success = self._update_dispatcharr_metadata(
+                                channel_data,
+                                retry_stream.get('stream_id'),
+                                retry_result['dispatcharr_metadata'],
+                                logger
+                            )
+                            retry_result['metadata_updated'] = update_success
 
                     # Update the original result in the results list
                     for j, existing_result in enumerate(results):
@@ -944,6 +1593,9 @@ class Plugin:
             self._save_progress()
             self._stop_status_updates()
 
+            # Trigger frontend refresh after metadata updates
+            self._trigger_frontend_refresh(settings, logger)
+
             # Set completion message
             processed_count = len(results)
             self.completion_message = f"Stream checking completed. Processed {processed_count} streams."
@@ -960,6 +1612,17 @@ class Plugin:
         import threading
         results_lock = threading.Lock()
         results_dict = {}  # Use dict to track results by stream index
+        
+        # Load channel data for metadata updates
+        channel_map = {}
+        try:
+            if os.path.exists(self.loaded_channels_file):
+                with open(self.loaded_channels_file, 'r') as f:
+                    loaded_channels = json.load(f)
+                    for channel in loaded_channels:
+                        channel_map[channel.get('id')] = channel
+        except Exception as e:
+            logger.warning(f"Could not load channel data for metadata updates: {e}")
 
         try:
             logger.info(f"Starting parallel stream checking with {workers} workers")
@@ -984,6 +1647,20 @@ class Plugin:
                     try:
                         result = future.result()
 
+                        # Update Dispatcharr metadata if available
+                        if result.get('dispatcharr_metadata'):
+                            channel_data = channel_map.get(stream_data.get('channel_id'))
+                            if channel_data:
+                                update_success = self._update_dispatcharr_metadata(
+                                    channel_data,
+                                    stream_data.get('stream_id'),
+                                    result['dispatcharr_metadata'],
+                                    logger
+                                )
+                                result['metadata_updated'] = update_success
+                            else:
+                                result['metadata_updated'] = False
+
                         with results_lock:
                             results_dict[index] = {**stream_data, **result}
                             self.check_progress["current"] = len(results_dict)
@@ -1007,18 +1684,19 @@ class Plugin:
             # Rebuild results list in original order
             results = [results_dict[i] for i in range(len(all_streams)) if i in results_dict]
 
-            # Handle retries for timeout streams if enabled
+            # Handle retries for streams with retryable errors if enabled
             if retries > 0:
-                timeout_streams = [(i, r) for i, r in enumerate(results) if r.get('error_type') == 'Timeout']
+                retryable_errors = ['Timeout', 'Connection Refused', 'Network Unreachable', 'Stream Unreachable', 'Server Error']
+                retry_streams = [(i, r) for i, r in enumerate(results) if r.get('error_type') in retryable_errors]
 
-                if timeout_streams:
-                    logger.info(f"Found {len(timeout_streams)} timeout streams, retrying...")
+                if retry_streams:
+                    logger.info(f"Found {len(retry_streams)} streams with retryable errors, retrying...")
 
                     for retry_pass in range(retries):
-                        if not timeout_streams:
+                        if not retry_streams:
                             break
 
-                        logger.info(f"Retry attempt {retry_pass + 1}/{retries} for {len(timeout_streams)} streams")
+                        logger.info(f"Retry attempt {retry_pass + 1}/{retries} for {len(retry_streams)} streams")
 
                         with ThreadPoolExecutor(max_workers=workers) as executor:
                             future_to_result_index = {
@@ -1027,20 +1705,34 @@ class Plugin:
                                     {k: v for k, v in result.items() if k in ['channel_id', 'channel_name', 'stream_url', 'stream_id']},
                                     timeout, 0, logger, skip_retries=True, settings=settings, retry_attempt=retry_pass + 1
                                 ): result_index
-                                for result_index, result in timeout_streams
+                                for result_index, result in retry_streams
                             }
 
                             for future in as_completed(future_to_result_index):
                                 result_index = future_to_result_index[future]
                                 try:
                                     retry_result = future.result()
+                                    
+                                    # Update Dispatcharr metadata if retry succeeded
+                                    if retry_result.get('dispatcharr_metadata'):
+                                        stream_data = results[result_index]
+                                        channel_data = channel_map.get(stream_data.get('channel_id'))
+                                        if channel_data:
+                                            update_success = self._update_dispatcharr_metadata(
+                                                channel_data,
+                                                stream_data.get('stream_id'),
+                                                retry_result['dispatcharr_metadata'],
+                                                logger
+                                            )
+                                            retry_result['metadata_updated'] = update_success
+                                    
                                     # Update the result
                                     results[result_index] = {**results[result_index], **retry_result}
                                 except Exception as e:
                                     logger.error(f"Error during retry: {e}")
 
-                        # Find remaining timeout streams for next retry
-                        timeout_streams = [(i, r) for i, r in enumerate(results) if r.get('error_type') == 'Timeout']
+                        # Find remaining streams with retryable errors for next retry
+                        retry_streams = [(i, r) for i, r in enumerate(results) if r.get('error_type') in retryable_errors]
 
             with open(self.results_file, 'w') as f:
                 json.dump(results, f, indent=2)
@@ -1052,6 +1744,9 @@ class Plugin:
             self.check_progress['end_time'] = time.time()
             self._save_progress()
             self._stop_status_updates()
+
+            # Trigger frontend refresh after metadata updates
+            self._trigger_frontend_refresh(settings, logger)
 
             # Set completion message
             processed_count = len(results)
@@ -1483,6 +2178,74 @@ class Plugin:
         else:
             return {"status": "success", "message": f"✅ Successfully deleted {deleted_count} CSV export file(s) from /data/exports/."}
 
+    def update_schedule_action(self, settings, logger):
+        """Update the scheduler configuration and restart the scheduler."""
+        try:
+            scheduled_times_str = settings.get("scheduled_times", "").strip()
+            scheduler_enabled = settings.get("enable_scheduler", False)
+            scheduler_timezone = settings.get("scheduler_timezone", SchedulerConfig.DEFAULT_TIMEZONE)
+            
+            # Save settings first
+            self._save_settings(settings)
+            
+            # If scheduled times are empty, stop the scheduler
+            if not scheduled_times_str:
+                logger.info("Scheduled times empty - stopping scheduler")
+                self._stop_background_scheduler()
+                return {
+                    "status": "success",
+                    "message": "✅ Schedule cleared. Scheduler has been stopped.\n\nTo enable scheduling, configure scheduled times and enable the scheduler."
+                }
+            
+            # Validate scheduled times format (cron expressions)
+            scheduled_times = self._parse_scheduled_times(scheduled_times_str)
+            if not scheduled_times:
+                return {
+                    "status": "error",
+                    "message": f"❌ Invalid cron expression format: '{scheduled_times_str}'\n\nPlease use cron format (e.g., '0 4 * * *' for daily at 4 AM).\nFormat: minute hour day month weekday"
+                }
+            
+            # Validate timezone
+            if PYTZ_AVAILABLE:
+                try:
+                    pytz.timezone(scheduler_timezone)
+                except pytz.exceptions.UnknownTimeZoneError:
+                    return {
+                        "status": "error",
+                        "message": f"❌ Unknown timezone: {scheduler_timezone}\n\nPlease select a valid timezone from the dropdown."
+                    }
+            else:
+                return {
+                    "status": "error",
+                    "message": "❌ Scheduler requires pytz library but it is not installed.\n\nPlease install pytz to use scheduling features."
+                }
+            
+            # Restart scheduler with new settings
+            logger.info(f"Updating schedule: Times={scheduled_times_str}, Timezone={scheduler_timezone}, Enabled={scheduler_enabled}")
+            self._start_background_scheduler(settings)
+            
+            # Build status message
+            times_display = ', '.join(scheduled_times)  # Already strings (cron expressions)
+            
+            if scheduler_enabled:
+                message = f"✅ Schedule updated successfully!\n\n"
+                message += f"Cron Schedules: {times_display}\n"
+                message += f"Timezone: {scheduler_timezone}\n"
+                message += f"Status: Enabled ✓\n\n"
+                message += f"The scheduler will run checks at the configured times."
+            else:
+                message = f"⚠️ Schedule configured but scheduler is DISABLED.\n\n"
+                message += f"Cron Schedules: {times_display}\n"
+                message += f"Timezone: {scheduler_timezone}\n"
+                message += f"Status: Disabled ✗\n\n"
+                message += f"Enable 'Enable Scheduled Checks' to activate the scheduler."
+            
+            return {"status": "success", "message": message}
+            
+        except Exception as e:
+            logger.error(f"Error updating schedule: {e}", exc_info=True)
+            return {"status": "error", "message": f"Failed to update schedule: {str(e)}"}
+
     def _perform_bulk_patch(self, token, settings, logger, payload):
         """Send a bulk PATCH request to the Dispatcharr API."""
         if not payload: return 0
@@ -1521,6 +2284,8 @@ class Plugin:
         url, channel_name = stream_data.get('stream_url'), stream_data.get('channel_name')
         last_error = "Unknown error"
         last_error_type = "Other"
+        
+        # Default return for dead streams with null metadata
         default_return = {
             'status': 'Dead',
             'error': '',
@@ -1528,6 +2293,20 @@ class Plugin:
             'format': 'N/A',
             'framerate_num': 0,
             'ffprobe_data': {},
+            'dispatcharr_metadata': {
+                'video_codec': None,
+                'resolution': '0x0',
+                'width': 0,
+                'height': 0,
+                'source_fps': None,
+                'pixel_format': None,
+                'video_bitrate': None,
+                'audio_codec': None,
+                'sample_rate': None,
+                'audio_channels': None,
+                'audio_bitrate': None,
+                'stream_type': None
+            },
             'retry_count': retry_attempt,
             'timeout_seconds': timeout,
             'ffprobe_monitoring_seconds': 0
@@ -1541,11 +2320,14 @@ class Plugin:
         max_attempts = 1 if skip_retries else (retries + 1)
 
         # Parse ffprobe flags from settings
-        ffprobe_flags_str = settings.get('ffprobe_flags', '-show_streams') if settings else '-show_streams'
+        ffprobe_flags_str = settings.get('ffprobe_flags', '-show_streams,-show_frames,-show_packets,-loglevel error') if settings else '-show_streams,-show_frames,-show_packets,-loglevel error'
         ffprobe_flags = [flag.strip() for flag in ffprobe_flags_str.split(',') if flag.strip()]
 
+        # Get ffprobe path from settings
+        ffprobe_path = settings.get('ffprobe_path', '/usr/local/bin/ffprobe') if settings else '/usr/local/bin/ffprobe'
+
         # Build base command
-        cmd = ['/usr/local/bin/ffprobe', '-print_format', 'json', '-user_agent', 'VLC/3.0.21 LibVLC/3.0.21', '-timeout', str(timeout * 1000000)]
+        cmd = [ffprobe_path, '-print_format', 'json', '-user_agent', 'VLC/3.0.21 LibVLC/3.0.21', '-timeout', str(timeout * 1000000)]
 
         # Add loglevel flag if specified, otherwise use default quiet mode
         has_loglevel = any('loglevel' in flag for flag in ffprobe_flags)
@@ -1591,11 +2373,68 @@ class Plugin:
                 if result.returncode == 0:
                     probe_data = json.loads(result.stdout)
                     video_stream = next((s for s in probe_data.get('streams', []) if s['codec_type'] == 'video'), None)
+                    audio_stream = next((s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio'), None)
+                    
                     if video_stream:
-                        resolution = f"{video_stream.get('width', 0)}x{video_stream.get('height', 0)}"
-                        framerate_num = self.parse_framerate(video_stream.get('r_frame_rate', '0/1'))
+                        # Extract video metadata
+                        width = video_stream.get('width', 0)
+                        height = video_stream.get('height', 0)
+                        resolution = f"{width}x{height}"
+                        framerate_num = round(self.parse_framerate(video_stream.get('r_frame_rate', '0/1')))
+                        video_codec = video_stream.get('codec_name', 'unknown')
+                        pixel_format = video_stream.get('pix_fmt', 'unknown')
+                        
+                        # Extract video bitrate (prefer bit_rate field, fallback to calculated)
+                        video_bitrate = None
+                        if video_stream.get('bit_rate'):
+                            try:
+                                video_bitrate = int(video_stream['bit_rate']) // 1000  # Convert to kbps
+                            except (ValueError, TypeError):
+                                pass
 
-                        # Collect additional ffprobe data
+                        # Extract audio metadata
+                        audio_codec = None
+                        sample_rate = None
+                        audio_channels = None
+                        audio_bitrate = None
+                        
+                        if audio_stream:
+                            audio_codec = audio_stream.get('codec_name', 'unknown')
+                            sample_rate = audio_stream.get('sample_rate')
+                            if sample_rate:
+                                try:
+                                    sample_rate = int(sample_rate)
+                                except (ValueError, TypeError):
+                                    sample_rate = None
+                            
+                            # Get channel layout
+                            audio_channels = audio_stream.get('channel_layout') or audio_stream.get('channels')
+                            if isinstance(audio_channels, int):
+                                # Convert channel count to layout name
+                                channel_map = {1: 'mono', 2: 'stereo', 6: '5.1', 8: '7.1'}
+                                audio_channels = channel_map.get(audio_channels, f'{audio_channels}ch')
+                            
+                            # Extract audio bitrate
+                            if audio_stream.get('bit_rate'):
+                                try:
+                                    audio_bitrate = int(audio_stream['bit_rate']) // 1000  # Convert to kbps
+                                except (ValueError, TypeError):
+                                    pass
+
+                        # Determine stream type from format
+                        stream_type = None
+                        if probe_data.get('format'):
+                            format_name = probe_data['format'].get('format_name', '')
+                            if 'mpegts' in format_name:
+                                stream_type = 'mpegts'
+                            elif 'hls' in format_name or 'm3u8' in format_name:
+                                stream_type = 'hls'
+                            elif 'flv' in format_name:
+                                stream_type = 'flv'
+                            else:
+                                stream_type = format_name.split(',')[0] if format_name else 'unknown'
+
+                        # Collect additional ffprobe data for export
                         ffprobe_extra_data = {}
 
                         # Add frame data if available
@@ -1604,24 +2443,36 @@ class Plugin:
                             ffprobe_extra_data['frame_count'] = len(frames)
                             ffprobe_extra_data['first_frame_pts'] = frames[0].get('pts', 'N/A') if frames else 'N/A'
 
-                        # Add packet data if available
+                        # Add packet data and calculate bitrate if available
                         if probe_data.get('packets'):
                             packets = probe_data['packets']
                             ffprobe_extra_data['packet_count'] = len(packets)
-                            # Calculate average bitrate from packets
-                            total_size = sum(int(p.get('size', 0)) for p in packets)
-                            total_duration = sum(float(p.get('duration_time', 0)) for p in packets)
-                            if total_duration > 0:
-                                avg_bitrate_kbps = (total_size * 8) / (total_duration * 1000)
-                                ffprobe_extra_data['avg_bitrate_kbps'] = round(avg_bitrate_kbps, 2)
-
-                        # Add codec info from streams
-                        if video_stream:
-                            ffprobe_extra_data['codec'] = video_stream.get('codec_name', 'N/A')
-                            ffprobe_extra_data['bitrate'] = video_stream.get('bit_rate', 'N/A')
+                            # Calculate average bitrate from packets if not already available
+                            if not video_bitrate:
+                                total_size = sum(int(p.get('size', 0)) for p in packets)
+                                total_duration = sum(float(p.get('duration_time', 0)) for p in packets)
+                                if total_duration > 0:
+                                    video_bitrate = int((total_size * 8) / (total_duration * 1000))
+                                    ffprobe_extra_data['calculated_bitrate_kbps'] = video_bitrate
 
                         stream_format = self._get_stream_format(resolution)
                         logger.info(f"✓ '{channel_name}' ALIVE - {stream_format} {resolution} {framerate_num:.1f}fps")
+
+                        # Build complete metadata for Dispatcharr integration
+                        dispatcharr_metadata = {
+                            'video_codec': video_codec,
+                            'resolution': resolution,
+                            'width': width,
+                            'height': height,
+                            'source_fps': framerate_num,
+                            'pixel_format': pixel_format,
+                            'video_bitrate': video_bitrate,
+                            'audio_codec': audio_codec,
+                            'sample_rate': sample_rate,
+                            'audio_channels': audio_channels,
+                            'audio_bitrate': audio_bitrate,
+                            'stream_type': stream_type
+                        }
 
                         return {
                             'status': 'Alive',
@@ -1630,6 +2481,7 @@ class Plugin:
                             'format': stream_format,
                             'framerate_num': framerate_num,
                             'ffprobe_data': ffprobe_extra_data,
+                            'dispatcharr_metadata': dispatcharr_metadata,
                             'retry_count': retry_attempt,
                             'timeout_seconds': timeout,
                             'ffprobe_monitoring_seconds': analysis_duration
@@ -1687,6 +2539,53 @@ class Plugin:
         return default_return
 
 # Export for Dispatcharr plugin system - Single shared instance to maintain state
+
+    def _update_dispatcharr_metadata(self, channel_data, stream_id, metadata, logger):
+        """Update stream metadata in Dispatcharr (PostgreSQL only to avoid orphaned Redis keys)"""
+        if not DISPATCHARR_INTEGRATION_AVAILABLE:
+            logger.debug("Dispatcharr integration not available - skipping metadata update")
+            return False
+        
+        if not metadata:
+            logger.debug(f"No metadata to update for stream {stream_id}")
+            return False
+        
+        try:
+            channel_uuid = channel_data.get('uuid')
+            if not channel_uuid:
+                logger.warning(f"Channel UUID not found for stream {stream_id} - skipping metadata update")
+                return False
+            
+            # Filter out None values for cleaner storage
+            clean_metadata = {k: v for k, v in metadata.items() if v is not None}
+            
+            if not clean_metadata:
+                logger.debug(f"No valid metadata to update for stream {stream_id}")
+                return False
+            
+            # Skip Redis updates to avoid "orphaned metadata" warnings from Dispatcharr's cleanup process
+            # Redis metadata is only meaningful for actively streaming channels
+            # PostgreSQL provides persistent storage which is sufficient for this plugin's purpose
+            
+            # Update PostgreSQL for persistent storage
+            try:
+                success = ChannelService._update_stream_stats_in_db(
+                    stream_id=stream_id,
+                    **clean_metadata
+                )
+                if success:
+                    logger.debug(f"Updated database metadata for stream {stream_id}")
+                else:
+                    logger.warning(f"Database metadata update returned False for stream {stream_id}")
+                return success
+            except Exception as e:
+                logger.error(f"Failed to update database metadata for stream {stream_id}: {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Unexpected error updating Dispatcharr metadata for stream {stream_id}: {e}")
+            return False
+
 _plugin_instance = Plugin()
 
 # Export the same instance with different names for compatibility

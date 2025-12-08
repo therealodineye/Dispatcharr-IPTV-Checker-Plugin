@@ -3,7 +3,7 @@
   "key": "iptv_checker",
   "module": "iptv_checker.plugin",
   "class": "Plugin",
-  "description": "A Dispatcharr Plugin that goes through a playlist to check IPTV channels,
+  "description": "A Dispatcharr Plugin that goes through a playlist to check IPTV channels",
   "author": "community",
   "homepage": "https://github.com/PiratesIRC/Dispatcharr-IPTV-Checker-Plugin",
   "actions": [
