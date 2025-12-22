@@ -65,7 +65,7 @@ class Plugin:
     # Explicitly set the plugin key
     key = "iptv_checker"
     name = "IPTV Checker"
-    version = "0.5.0"
+    version = "0.5.1"
     description = "Check stream status and quality for channels in specified Dispatcharr groups."
 
     @staticmethod
@@ -280,6 +280,41 @@ class Plugin:
                 "type": "boolean",
                 "default": False,
                 "help_text": "Automatically export results to CSV after scheduled checks complete.",
+            },
+            {
+                "id": "scheduler_rename_dead_channels",
+                "label": "💀 Rename Dead Channels After Scheduled Checks",
+                "type": "boolean",
+                "default": False,
+                "help_text": "Automatically rename dead channels after scheduled checks complete.",
+            },
+            {
+                "id": "scheduler_rename_low_framerate_channels",
+                "label": "🐌 Rename Low Framerate Channels After Scheduled Checks",
+                "type": "boolean",
+                "default": False,
+                "help_text": "Automatically rename low framerate channels after scheduled checks complete.",
+            },
+            {
+                "id": "scheduler_add_video_format_suffix",
+                "label": "🎬 Add Video Format Suffix After Scheduled Checks",
+                "type": "boolean",
+                "default": False,
+                "help_text": "Automatically add video format suffixes to channels after scheduled checks complete.",
+            },
+            {
+                "id": "scheduler_move_dead_channels",
+                "label": "⚰️ Move Dead Channels After Scheduled Checks",
+                "type": "boolean",
+                "default": False,
+                "help_text": "Automatically move dead channels to the configured group after scheduled checks complete.",
+            },
+            {
+                "id": "scheduler_move_low_framerate_channels",
+                "label": "📁 Move Low Framerate Channels After Scheduled Checks",
+                "type": "boolean",
+                "default": False,
+                "help_text": "Automatically move low framerate channels to the configured group after scheduled checks complete.",
             }
         ]
 
@@ -687,6 +722,36 @@ class Plugin:
                 LOGGER.info("⏰ SCHEDULED: Exporting results to CSV...")
                 export_result = self.export_results_action(settings, scheduled_logger)
                 LOGGER.info(f"⏰ SCHEDULED: {export_result.get('message')}")
+            
+            # Step 4: Rename dead channels if enabled
+            if settings.get('scheduler_rename_dead_channels', False):
+                LOGGER.info("⏰ SCHEDULED: Renaming dead channels...")
+                rename_result = self.rename_channels_action(settings, scheduled_logger)
+                LOGGER.info(f"⏰ SCHEDULED: {rename_result.get('message')}")
+            
+            # Step 5: Rename low framerate channels if enabled
+            if settings.get('scheduler_rename_low_framerate_channels', False):
+                LOGGER.info("⏰ SCHEDULED: Renaming low framerate channels...")
+                rename_low_fps_result = self.rename_low_framerate_channels_action(settings, scheduled_logger)
+                LOGGER.info(f"⏰ SCHEDULED: {rename_low_fps_result.get('message')}")
+            
+            # Step 6: Add video format suffix if enabled
+            if settings.get('scheduler_add_video_format_suffix', False):
+                LOGGER.info("⏰ SCHEDULED: Adding video format suffixes...")
+                suffix_result = self.add_video_format_suffix_action(settings, scheduled_logger)
+                LOGGER.info(f"⏰ SCHEDULED: {suffix_result.get('message')}")
+            
+            # Step 7: Move dead channels if enabled
+            if settings.get('scheduler_move_dead_channels', False):
+                LOGGER.info("⏰ SCHEDULED: Moving dead channels to group...")
+                move_dead_result = self.move_dead_channels_action(settings, scheduled_logger)
+                LOGGER.info(f"⏰ SCHEDULED: {move_dead_result.get('message')}")
+            
+            # Step 8: Move low framerate channels if enabled
+            if settings.get('scheduler_move_low_framerate_channels', False):
+                LOGGER.info("⏰ SCHEDULED: Moving low framerate channels to group...")
+                move_low_fps_result = self.move_low_framerate_channels_action(settings, scheduled_logger)
+                LOGGER.info(f"⏰ SCHEDULED: {move_low_fps_result.get('message')}")
             
             LOGGER.info("⏰ SCHEDULED: Check sequence completed successfully")
             
