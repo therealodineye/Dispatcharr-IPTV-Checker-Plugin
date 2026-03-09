@@ -4,7 +4,6 @@ Checks stream status and analyzes stream quality
 """
 
 import logging
-import requests
 import subprocess
 import json
 import os
@@ -15,7 +14,13 @@ import threading
 import urllib.request
 import urllib.error
 from datetime import datetime
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Django ORM imports (plugins run inside the Django backend process)
+from apps.channels.models import Channel, ChannelGroup, Stream, ChannelStream
+from django.db import transaction
+from core.utils import send_websocket_update
 
 # Scheduler imports
 try:
@@ -28,11 +33,9 @@ except ImportError:
 # Django/Dispatcharr imports for metadata updates
 try:
     from apps.proxy.ts_proxy.services.channel_service import ChannelService
-    from apps.channels.models import Stream
     DISPATCHARR_INTEGRATION_AVAILABLE = True
 except ImportError:
     DISPATCHARR_INTEGRATION_AVAILABLE = False
-    LOGGER.warning("Dispatcharr integration not available - metadata updates will be skipped")
 
 # Setup logging with plugin name for Dispatcharr's logging system
 class PluginNameFilter(logging.Filter):
@@ -43,7 +46,6 @@ class PluginNameFilter(logging.Filter):
         return True
 
 LOGGER = logging.getLogger("plugins.iptv_checker")
-LOGGER.setLevel(logging.INFO)
 LOGGER.addFilter(PluginNameFilter())
 
 # --- Scheduler Globals ---
@@ -65,7 +67,7 @@ class Plugin:
     # Explicitly set the plugin key
     key = "iptv_checker"
     name = "IPTV Checker"
-    version = "0.5.1"
+    version = "0.6.0a"
     description = "Check stream status and quality for channels in specified Dispatcharr groups."
 
     @staticmethod
@@ -127,27 +129,6 @@ class Plugin:
                 "label": "📦 Plugin Version",
                 "type": "info",
                 "help_text": version_message,
-            },
-            {
-                "id": "dispatcharr_url",
-                "label": "🌐 Dispatcharr URL",
-                "type": "string",
-                "default": "",
-                "placeholder": "http://192.168.1.10:9191",
-                "help_text": "URL of your Dispatcharr instance (from your browser's address bar). Example: http://127.0.0.1:9191",
-            },
-            {
-                "id": "dispatcharr_username",
-                "label": "👤 Dispatcharr Admin Username",
-                "type": "string",
-                "help_text": "Your admin username for the Dispatcharr UI. Required for WRITE operations.",
-            },
-            {
-                "id": "dispatcharr_password",
-                "label": "🔑 Dispatcharr Admin Password",
-                "type": "string",
-                "input_type": "password",
-                "help_text": "Your admin password for the Dispatcharr UI. Required for WRITE operations.",
             },
             {
                 "id": "group_names",
@@ -322,7 +303,7 @@ class Plugin:
         {
             "id": "validate_settings",
             "label": "✅ Validate Settings",
-            "description": "Validate all plugin settings (API connection, credentials, groups, etc.).",
+            "description": "Validate all plugin settings (database connectivity, groups, etc.).",
         },
         {
             "id": "update_schedule",
@@ -424,9 +405,6 @@ class Plugin:
         self.pending_status_message = None
         self.completion_message = None
         self.timeout_retry_queue = []  # Queue for streams that timed out and need retry
-        self.cached_token = None  # Cached API token
-        self.token_cache_time = None  # Time when token was cached
-        self.token_cache_duration = 3600  # Cache token for 1 hour (3600 seconds)
         self.version_check_cache = None  # Cached version check result
         self.version_check_time = None  # Time when version was last checked
         self.version_check_duration = 86400  # Check version once per day (24 hours)
@@ -883,13 +861,14 @@ class Plugin:
                 "update_schedule": self.update_schedule_action,
                 "cleanup_orphaned_tasks": self.cleanup_orphaned_tasks_action,
                 "check_scheduler_status": self.check_scheduler_status_action,
+                "get_status_update": self.get_status_update_action,
             }
 
             if action not in action_map:
                 return {"status": "error", "message": f"Unknown action: {action}"}
 
             # Pass context to actions that need it
-            if action in ["check_streams"]:
+            if action in ["check_streams", "get_status_update"]:
                 return action_map[action](settings, logger, context)
             else:
                 return action_map[action](settings, logger)
@@ -973,61 +952,42 @@ class Plugin:
                 logger.info(f"STATUS UPDATE READY: {self.pending_status_message}")
 
     def validate_settings_action(self, settings, logger):
-        """Validate all plugin settings including API connection, credentials, and groups."""
+        """Validate all plugin settings including database connectivity and groups."""
         validation_results = []
         has_errors = False
 
-        # Validate Dispatcharr URL
-        dispatcharr_url = settings.get("dispatcharr_url", "").strip()
-        if not dispatcharr_url:
-            validation_results.append("❌ Dispatcharr URL is not configured")
-            has_errors = True
+        # Test database connectivity directly
+        try:
+            channel_count = Channel.objects.count()
+            group_count = ChannelGroup.objects.count()
+            stream_count = Stream.objects.count()
+            validation_results.append(
+                f"✅ DB OK ({channel_count} channels, {group_count} groups, {stream_count} streams)"
+            )
 
-        # Validate credentials
-        username = settings.get("dispatcharr_username", "").strip()
-        password = settings.get("dispatcharr_password", "").strip()
+            # Validate groups if specified
+            group_names_str = settings.get("group_names", "").strip()
+            if group_names_str:
+                try:
+                    all_groups = self._get_all_groups(logger)
+                    group_name_to_id = {g['name']: g['id'] for g in all_groups}
+                    input_names = {name.strip() for name in group_names_str.split(',') if name.strip()}
+                    valid_names = {n for n in input_names if n in group_name_to_id}
+                    invalid_names = input_names - valid_names
 
-        if not username:
-            validation_results.append("❌ Admin Username is not configured")
-            has_errors = True
-
-        if not password:
-            validation_results.append("❌ Admin Password is not configured")
-            has_errors = True
-
-        # Test API connection and login if all credentials are provided
-        if dispatcharr_url and username and password:
-            try:
-                token, error = self._get_api_token(settings, logger)
-                if error:
-                    validation_results.append(f"❌ API login failed: {error}")
+                    if valid_names:
+                        validation_results.append(f"✅ Groups: {', '.join(valid_names)}")
+                    if invalid_names:
+                        validation_results.append(f"⚠️ Invalid groups: {', '.join(invalid_names)}")
+                        has_errors = True
+                except Exception as e:
+                    validation_results.append(f"❌ Failed to validate groups: {str(e)}")
                     has_errors = True
-                else:
-                    validation_results.append("✅ API login successful")
-
-                    # Validate groups if specified
-                    group_names_str = settings.get("group_names", "").strip()
-                    if group_names_str:
-                        try:
-                            all_groups = self._get_api_data("/api/channels/groups/", token, settings)
-                            group_name_to_id = {g['name']: g['id'] for g in all_groups if 'name' in g and 'id' in g}
-                            input_names = {name.strip() for name in group_names_str.split(',') if name.strip()}
-                            valid_names = {n for n in input_names if n in group_name_to_id}
-                            invalid_names = input_names - valid_names
-
-                            if valid_names:
-                                validation_results.append(f"✅ Groups: {', '.join(valid_names)}")
-                            if invalid_names:
-                                validation_results.append(f"⚠️ Invalid groups: {', '.join(invalid_names)}")
-                                has_errors = True
-                        except Exception as e:
-                            validation_results.append(f"❌ Failed to validate groups: {str(e)}")
-                            has_errors = True
-                    else:
-                        validation_results.append("ℹ️ No groups specified (will check all)")
-            except Exception as e:
-                validation_results.append(f"❌ Validation error: {str(e)}")
-                has_errors = True
+            else:
+                validation_results.append("ℹ️ No groups specified (will check all)")
+        except Exception as e:
+            validation_results.append(f"❌ DB error: {str(e)[:100]}")
+            has_errors = True
 
         # Validate other settings - simplified display
         timeout = settings.get("timeout", 10)
@@ -1192,184 +1152,136 @@ class Plugin:
 
         return {"status": "success", "message": "\n".join(summary)}
 
-    def _get_api_token(self, settings, logger, force_refresh=False):
-        """Get an API access token using username and password with caching."""
-        # Check if we have a valid cached token
-        if not force_refresh and self.cached_token and self.token_cache_time:
-            time_elapsed = time.time() - self.token_cache_time
-            if time_elapsed < self.token_cache_duration:
-                logger.debug(f"Using cached API token (age: {time_elapsed:.0f}s)")
-                return self.cached_token, None
-
-        dispatcharr_url = settings.get("dispatcharr_url", "").strip().rstrip('/')
-        username = settings.get("dispatcharr_username", "")
-        password = settings.get("dispatcharr_password", "")
-
-        if not all([dispatcharr_url, username, password]):
-            return None, "Dispatcharr URL, Username, and Password must be configured."
-
-        try:
-            url = f"{dispatcharr_url}/api/accounts/token/"
-            payload = {"username": username, "password": password}
-            response = requests.post(url, json=payload, timeout=15)
-
-            if response.status_code == 401:
-                # Invalidate cache on auth failure
-                self.cached_token = None
-                self.token_cache_time = None
-                return None, "Authentication failed. Please check your username and password."
-
-            response.raise_for_status()
-            access_token = response.json().get("access")
-
-            if not access_token:
-                return None, "Login successful, but no access token was returned by the API."
-
-            # Cache the token
-            self.cached_token = access_token
-            self.token_cache_time = time.time()
-
-            logger.info("Successfully obtained and cached API access token.")
-            return access_token, None
-        except requests.exceptions.ConnectionError as e:
-            return None, f"Unable to connect to the Dispatcharr URL: {e}"
-        except requests.RequestException as e:
-            return None, f"A network error occurred while authenticating: {e}"
-
-    def _get_api_data(self, endpoint, token, settings):
-        """Helper to perform GET requests to the Dispatcharr API."""
-        dispatcharr_url = settings.get("dispatcharr_url", "").strip().rstrip('/')
-        url = f"{dispatcharr_url}{endpoint}"
-        headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        json_data = response.json()
-        if isinstance(json_data, dict):
-            return json_data.get('results', json_data)
-        elif isinstance(json_data, list):
-            return json_data
-        return []
-    
-    def _post_api_data(self, endpoint, token, payload, settings):
-        """Helper to perform POST requests to the Dispatcharr API."""
-        dispatcharr_url = settings.get("dispatcharr_url", "").strip().rstrip('/')
-        url = f"{dispatcharr_url}{endpoint}"
-        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        return response.json()
-
     def _trigger_frontend_refresh(self, settings, logger):
         """Trigger frontend channel list refresh via WebSocket"""
         try:
-            from channels.layers import get_channel_layer
-            from asgiref.sync import async_to_sync
-
-            channel_layer = get_channel_layer()
-            if channel_layer:
-                # Send WebSocket message to trigger frontend refresh
-                async_to_sync(channel_layer.group_send)(
-                    "dispatcharr_updates",
-                    {
-                        "type": "channels.updated",
-                        "message": "Channel list updated by IPTV Checker"
-                    }
-                )
-                logger.info("Frontend refresh triggered via WebSocket")
-                return True
+            send_websocket_update('updates', 'update', {
+                "type": "plugin",
+                "plugin": self.name,
+                "message": "Channels updated"
+            })
+            logger.info("Frontend refresh triggered via WebSocket")
+            return True
         except Exception as e:
             logger.warning(f"Could not trigger frontend refresh: {e}")
         return False
 
+    def _get_all_groups(self, logger):
+        """Fetch all channel groups via Django ORM."""
+        return list(ChannelGroup.objects.all().values('id', 'name'))
+
+    def _get_all_channels(self, logger, group_ids=None):
+        """Fetch channels via Django ORM, optionally filtered by group IDs."""
+        qs = Channel.objects.select_related('channel_group').all()
+        if group_ids:
+            qs = qs.filter(channel_group_id__in=group_ids)
+        return list(qs.values('id', 'name', 'channel_number', 'channel_group_id', 'uuid'))
+
+    def _get_channel_streams_bulk(self, channel_ids, logger, check_alternative=True):
+        """Fetch streams for multiple channels in a single query.
+
+        Returns dict mapping channel_id -> list of stream dicts.
+        """
+        qs = ChannelStream.objects.filter(
+            channel_id__in=channel_ids
+        ).select_related('stream').order_by('channel_id', 'order')
+
+        if not check_alternative:
+            qs = qs.filter(order=0)
+
+        streams_by_channel = defaultdict(list)
+        for cs in qs:
+            streams_by_channel[cs.channel_id].append({
+                'id': cs.stream.id,
+                'name': cs.stream.name,
+                'url': cs.stream.url,
+                'channelstream': {'order': cs.order}
+            })
+        return streams_by_channel
+
+    def _bulk_update_channels(self, updates, fields, logger):
+        """Bulk update Channel instances.
+
+        Args:
+            updates: list of dicts with 'id' and fields to update
+            fields: list of field names to update
+        """
+        if not updates:
+            return 0
+        channel_ids = [u['id'] for u in updates]
+        channels = {ch.id: ch for ch in Channel.objects.filter(id__in=channel_ids)}
+        to_update = []
+        for u in updates:
+            ch = channels.get(u['id'])
+            if ch:
+                for field in fields:
+                    if field in u:
+                        setattr(ch, field, u[field])
+                to_update.append(ch)
+        if to_update:
+            with transaction.atomic():
+                Channel.objects.bulk_update(to_update, fields)
+            logger.info(f"Bulk updated {len(to_update)} channels (fields: {', '.join(fields)})")
+        return len(to_update)
+
+    def _get_or_create_group(self, name, logger):
+        """Get or create a channel group by name."""
+        group, created = ChannelGroup.objects.get_or_create(name=name)
+        if created:
+            logger.info(f"Created new group '{name}' (ID: {group.id})")
+        return group
+
     def load_groups_action(self, settings, logger):
         """Load channels and streams from specified Dispatcharr groups."""
         try:
-            token, error = self._get_api_token(settings, logger)
-            if error: return {"status": "error", "message": error}
-
             group_names_str = settings.get("group_names", "").strip()
-            all_groups = self._get_api_data("/api/channels/groups/", token, settings)
-            group_name_to_id = {g['name']: g['id'] for g in all_groups if 'name' in g and 'id' in g}
+
+            # Debug logging for group selection
+            logger.info(f"Group Names Setting: '{group_names_str}' (empty={not group_names_str})")
+
+            all_groups = self._get_all_groups(logger)
+            group_name_to_id = {g['name']: g['id'] for g in all_groups}
 
             if not group_names_str:
+                # Log warning when loading all groups
+                logger.warning("⚠️ No channel groups specified - this will load ALL groups. To filter, specify group names in the 'Channel Groups' field.")
+                logger.warning(f"⚠️ Total groups found: {len(group_name_to_id)}")
+                logger.warning(f"⚠️ Groups: {', '.join(sorted(group_name_to_id.keys()))}")
+
                 target_group_names, target_group_ids = set(group_name_to_id.keys()), set(group_name_to_id.values())
                 if not target_group_ids: return {"status": "error", "message": "No groups found in Dispatcharr."}
             else:
                 input_names = {name.strip() for name in group_names_str.split(',') if name.strip()}
                 valid_names, invalid_names = {n for n in input_names if n in group_name_to_id}, input_names - {n for n in input_names if n in group_name_to_id}
                 target_group_ids, target_group_names = {group_name_to_id[name] for name in valid_names}, valid_names
+
+                # Log which groups are being loaded
+                logger.info(f"✓ Loading specified groups: {', '.join(sorted(target_group_names))}")
+                if invalid_names:
+                    logger.warning(f"⚠️ Groups not found: {', '.join(invalid_names)}")
+
                 if not target_group_ids: return {"status": "error", "message": f"None of the specified groups could be found: {', '.join(invalid_names)}"}
 
-            all_channels = self._get_api_data("/api/channels/channels/", token, settings)
-            channels_in_groups = [ch for ch in all_channels if ch.get('channel_group_id') in target_group_ids]
-            
-            # For small channel counts (<100), load synchronously
-            if len(channels_in_groups) < 100:
-                return self._load_groups_sync(channels_in_groups, settings, logger, group_names_str, target_group_names)
-            
-            # For large channel counts, load in background
-            logger.info(f"Loading {len(channels_in_groups)} channels in background to avoid timeout...")
-            
-            # Initialize progress
-            self.load_progress = {
-                "current": 0,
-                "total": len(channels_in_groups),
-                "status": "loading",
-                "start_time": time.time()
-            }
-            
-            # Start background loading
-            loading_thread = threading.Thread(
-                target=self._load_groups_background,
-                args=(channels_in_groups, settings, logger, group_names_str, target_group_names, token)
-            )
-            loading_thread.daemon = True
-            loading_thread.start()
-            
-            group_msg = "all groups" if not group_names_str else f"group(s): {', '.join(target_group_names)}"
-            
-            # Calculate ETA (approximately 0.5 seconds per channel for API calls)
-            estimated_seconds = len(channels_in_groups) * 0.5
-            if estimated_seconds < 60:
-                eta_msg = f"~{int(estimated_seconds)} seconds"
-            else:
-                eta_minutes = int(estimated_seconds / 60)
-                eta_msg = f"~{eta_minutes} minute{'s' if eta_minutes != 1 else ''}"
-            
-            # Preview stream check time estimation
-            check_alternative_streams = settings.get("check_alternative_streams", True)
-            parallel_enabled = settings.get("enable_parallel_checking", False)
-            parallel_workers = settings.get("parallel_workers", 2)
-            
-            # Rough estimate: 1.2 streams per channel on average
-            estimated_streams = int(len(channels_in_groups) * 1.2)
-            if parallel_enabled:
-                check_estimated_seconds = (estimated_streams / parallel_workers) * 10
-                check_mode_info = f" (parallel mode with {parallel_workers} workers)"
-            else:
-                check_estimated_seconds = estimated_streams * 10
-                check_mode_info = " (sequential mode)"
-            check_estimated_minutes = int(check_estimated_seconds / 60)
-            
-            return {
-                "status": "success", 
-                "message": f"⏳ Loading {len(channels_in_groups)} channels from {group_msg} in background...\n\nLoading time: {eta_msg}\nStream check time (after loading): ~{check_estimated_minutes} minutes{check_mode_info}\n\nYou can close this dialog and check back later.\n\nOnce complete, use '▶️ Start Stream Check' to begin checking."
-            }
-            
-        except Exception as e: 
+            channels_in_groups = self._get_all_channels(logger, group_ids=target_group_ids)
+
+            # ORM is fast — always load synchronously
+            return self._load_groups_sync(channels_in_groups, settings, logger, group_names_str, target_group_names)
+
+        except Exception as e:
             return {"status": "error", "message": str(e)}
 
     def _load_groups_sync(self, channels_in_groups, settings, logger, group_names_str, target_group_names):
-        """Synchronously load groups (for small channel counts)"""
+        """Load groups using bulk ORM queries."""
         check_alternative_streams = settings.get("check_alternative_streams", True)
-        token, _ = self._get_api_token(settings, logger)
+
+        # Bulk-fetch all streams for all channels in one query
+        channel_ids = [ch['id'] for ch in channels_in_groups]
+        streams_by_channel = self._get_channel_streams_bulk(channel_ids, logger, check_alternative=check_alternative_streams)
+
         loaded_channels = []
-        
         for channel in channels_in_groups:
-            logger.info(f"Fetching streams for channel: {channel.get('name')}")
-            channel_streams = self._get_api_data(f"/api/channels/channels/{channel['id']}/streams/", token, settings)
-            
+            channel_streams = streams_by_channel.get(channel['id'], [])
+
             # Log detailed stream information
             if check_alternative_streams and channel_streams:
                 logger.info(f"  Channel '{channel.get('name')}' has {len(channel_streams)} stream(s)")
@@ -1379,71 +1291,13 @@ class Plugin:
                     logger.info(f"    - {stream_type}: {stream.get('name', 'Unnamed')} (ID: {stream.get('id')})")
             elif channel_streams:
                 logger.info(f"  Channel '{channel.get('name')}' has {len(channel_streams)} stream(s) (primary only)")
-            
-            # Filter to only primary stream if alternative streams check is disabled
-            if not check_alternative_streams and channel_streams:
-                channel_streams = [s for s in channel_streams if s.get('channelstream', {}).get('order') == 0]
-            
+
             loaded_channels.append({**channel, "streams": channel_streams})
-        
-        with open(self.loaded_channels_file, 'w') as f: 
+
+        with open(self.loaded_channels_file, 'w') as f:
             json.dump(loaded_channels, f)
 
         return self._build_load_success_message(loaded_channels, settings, group_names_str, target_group_names)
-    
-    def _load_groups_background(self, channels_in_groups, settings, logger, group_names_str, target_group_names, token):
-        """Background loading for large channel counts"""
-        try:
-            check_alternative_streams = settings.get("check_alternative_streams", True)
-            loaded_channels = []
-            
-            # Initialize progress tracking
-            self.load_progress = {
-                "current": 0,
-                "total": len(channels_in_groups),
-                "status": "loading",
-                "start_time": time.time()
-            }
-            
-            logger.info(f"Background loading started for {len(channels_in_groups)} channels")
-            
-            for i, channel in enumerate(channels_in_groups, 1):
-                # Update progress
-                self.load_progress["current"] = i
-                
-                if i % 100 == 0:
-                    logger.info(f"Progress: Loaded {i}/{len(channels_in_groups)} channels...")
-                
-                try:
-                    channel_streams = self._get_api_data(f"/api/channels/channels/{channel['id']}/streams/", token, settings)
-                    
-                    # Filter to only primary stream if alternative streams check is disabled
-                    if not check_alternative_streams and channel_streams:
-                        channel_streams = [s for s in channel_streams if s.get('channelstream', {}).get('order') == 0]
-                    
-                    loaded_channels.append({**channel, "streams": channel_streams})
-                except Exception as e:
-                    logger.error(f"Failed to load streams for channel {channel.get('name')}: {e}")
-                    # Add channel without streams
-                    loaded_channels.append({**channel, "streams": []})
-            
-            with open(self.loaded_channels_file, 'w') as f: 
-                json.dump(loaded_channels, f)
-            
-            total_streams = sum(len(c.get('streams', [])) for c in loaded_channels)
-            
-            # Mark as complete
-            self.load_progress["status"] = "idle"
-            self.load_progress["end_time"] = time.time()
-            
-            logger.info(f"✅ Background loading completed: {len(loaded_channels)} channels with {total_streams} streams")
-            
-            # Set completion message
-            self.completion_message = f"✅ Loading completed: {len(loaded_channels)} channels with {total_streams} streams loaded.\n\nReady to start stream check."
-            
-        except Exception as e:
-            self.load_progress["status"] = "idle"
-            logger.error(f"Error during background loading: {e}", exc_info=True)
     
     def _build_load_success_message(self, loaded_channels, settings, group_names_str, target_group_names):
         """Build success message for load groups action"""
@@ -1524,7 +1378,6 @@ class Plugin:
             mode_info = "sequential mode"
 
         # Start the actual processing in background
-        import threading
         processing_thread = threading.Thread(
             target=self._process_streams_background,
             args=(all_streams, settings, logger)
@@ -1860,9 +1713,7 @@ class Plugin:
         if not payload: return {"status": "success", "message": "No channels needed renaming."}
 
         try:
-            token, error = self._get_api_token(settings, logger)
-            if error: return {"status": "error", "message": error}
-            count = self._perform_bulk_patch(token, settings, logger, payload)
+            count = self._bulk_update_channels(payload, ['name'], logger)
             self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully renamed {count} dead channels. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
@@ -1882,23 +1733,11 @@ class Plugin:
         if not dead_channel_ids: return {"status": "success", "message": "No dead channels were found in the last check."}
         
         try:
-            token, error = self._get_api_token(settings, logger)
-            if error: return {"status": "error", "message": error}
-            
-            all_groups = self._get_api_data("/api/channels/groups/", token, settings)
-            dest_group = next((g for g in all_groups if g['name'] == move_to_group_name), None)
+            dest_group = self._get_or_create_group(move_to_group_name, logger)
+            new_group_id = dest_group.id
 
-            if dest_group:
-                new_group_id = dest_group['id']
-                logger.info(f"Destination group '{move_to_group_name}' found with ID: {new_group_id}")
-            else:
-                logger.info(f"Destination group '{move_to_group_name}' not found. Creating it...")
-                new_group = self._post_api_data("/api/channels/groups/", token, {'name': move_to_group_name}, settings)
-                new_group_id = new_group['id']
-                logger.info(f"Group '{move_to_group_name}' created with ID: {new_group_id}")
-            
             payload = [{'id': cid, 'channel_group_id': new_group_id} for cid in dead_channel_ids]
-            moved_count = self._perform_bulk_patch(token, settings, logger, payload)
+            moved_count = self._bulk_update_channels(payload, ['channel_group_id'], logger)
             self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully moved {moved_count} dead channels to group '{move_to_group_name}'. GUI refresh triggered."}
 
@@ -1932,9 +1771,7 @@ class Plugin:
         if not payload: return {"status": "success", "message": "No channels needed renaming."}
 
         try:
-            token, error = self._get_api_token(settings, logger)
-            if error: return {"status": "error", "message": error}
-            count = self._perform_bulk_patch(token, settings, logger, payload)
+            count = self._bulk_update_channels(payload, ['name'], logger)
             self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully renamed {count} low framerate channels. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
@@ -1954,21 +1791,11 @@ class Plugin:
         if not low_fps_channel_ids: return {"status": "success", "message": "No low framerate channels found to move."}
         
         try:
-            token, error = self._get_api_token(settings, logger)
-            if error: return {"status": "error", "message": error}
-            
-            all_groups = self._get_api_data("/api/channels/groups/", token, settings)
-            dest_group = next((g for g in all_groups if g['name'] == group_name), None)
+            dest_group = self._get_or_create_group(group_name, logger)
+            new_group_id = dest_group.id
 
-            if dest_group:
-                new_group_id = dest_group['id']
-            else:
-                logger.info(f"Destination group '{group_name}' not found. Creating it...")
-                new_group = self._post_api_data("/api/channels/groups/", token, {'name': group_name}, settings)
-                new_group_id = new_group['id']
-            
             payload = [{'id': cid, 'channel_group_id': new_group_id} for cid in low_fps_channel_ids]
-            moved_count = self._perform_bulk_patch(token, settings, logger, payload)
+            moved_count = self._bulk_update_channels(payload, ['channel_group_id'], logger)
             self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully moved {moved_count} low framerate channels to group '{group_name}'. GUI refresh triggered."}
         except Exception as e: return {"status": "error", "message": str(e)}
@@ -2004,12 +1831,9 @@ class Plugin:
         if not channel_formats: return {"status": "success", "message": "No alive channels found to update."}
 
         try:
-            token, error = self._get_api_token(settings, logger)
-            if error: return {"status": "error", "message": error}
-
-            all_channels = self._get_api_data("/api/channels/channels/", token, settings)
+            all_channels = self._get_all_channels(logger)
             channel_id_to_name = {c['id']: c['name'] for c in all_channels}
-            logger.info(f"DEBUG: Retrieved {len(all_channels)} channels from API")
+            logger.info(f"DEBUG: Retrieved {len(all_channels)} channels from DB")
 
             payload = []
             skipped_not_in_suffixes = 0
@@ -2027,7 +1851,7 @@ class Plugin:
 
                 current_name = channel_id_to_name.get(cid)
                 if not current_name:
-                    logger.debug(f"DEBUG:   - Skipped: channel_id {cid} not found in API channels")
+                    logger.debug(f"DEBUG:   - Skipped: channel_id {cid} not found in DB channels")
                     skipped_channel_not_found += 1
                     continue
 
@@ -2048,7 +1872,7 @@ class Plugin:
             logger.info(f"DEBUG:   - Channels to update: {len(payload)}")
             logger.info(f"DEBUG:   - Skipped (format not in configured list): {skipped_not_in_suffixes}")
             logger.info(f"DEBUG:   - Skipped (already has suffix): {skipped_already_has_suffix}")
-            logger.info(f"DEBUG:   - Skipped (channel not found in API): {skipped_channel_not_found}")
+            logger.info(f"DEBUG:   - Skipped (channel not found in DB): {skipped_channel_not_found}")
 
             if not payload:
                 reason_parts = []
@@ -2057,12 +1881,12 @@ class Plugin:
                 if skipped_not_in_suffixes > 0:
                     reason_parts.append(f"{skipped_not_in_suffixes} format not in configured list")
                 if skipped_channel_not_found > 0:
-                    reason_parts.append(f"{skipped_channel_not_found} not found in API")
+                    reason_parts.append(f"{skipped_channel_not_found} not found in DB")
 
                 reason = " • ".join(reason_parts) if reason_parts else "All channels already up to date"
                 return {"status": "success", "message": f"No channels needed a format suffix added.\n\nReason: {reason}"}
 
-            updated_count = self._perform_bulk_patch(token, settings, logger, payload)
+            updated_count = self._bulk_update_channels(payload, ['name'], logger)
             self._trigger_frontend_refresh(settings, logger)
             return {"status": "success", "message": f"Successfully added format suffixes to {updated_count} channels. GUI refresh triggered."}
 
@@ -2469,18 +2293,6 @@ class Plugin:
                 "message": f"❌ Failed to check scheduler status: {str(e)}"
             }
 
-    def _perform_bulk_patch(self, token, settings, logger, payload):
-        """Send a bulk PATCH request to the Dispatcharr API."""
-        if not payload: return 0
-        dispatcharr_url = settings.get("dispatcharr_url", "").strip().rstrip('/')
-        url = f"{dispatcharr_url}/api/channels/channels/edit/bulk/"
-        headers = {'Authorization': f"Bearer {token}", 'Content-Type': 'application/json'}
-        logger.info(f"Sending bulk patch for {len(payload)} channels.")
-        response = requests.patch(url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        logger.info(f"Successfully patched {len(payload)} channels.")
-        return len(payload)
-
     def _get_stream_format(self, resolution_str):
         """Determine video format from a resolution string."""
         if 'x' not in resolution_str: return "Unknown"
@@ -2502,12 +2314,32 @@ class Plugin:
             return float(framerate_str)
         except (ValueError, ZeroDivisionError): return 0
 
+    def _mask_url_in_error(self, error_message, stream_url, stream_id):
+        """Mask URLs in error messages to avoid exposing sensitive stream URLs."""
+        if not error_message or not stream_url:
+            return error_message
+
+        # Replace full URL with stream ID reference
+        masked_error = error_message.replace(stream_url, f"[Stream ID: {stream_id}]")
+
+        # Also try to mask URL-encoded version
+        try:
+            import urllib.parse
+            encoded_url = urllib.parse.quote(stream_url, safe='')
+            if encoded_url in masked_error:
+                masked_error = masked_error.replace(encoded_url, f"[Stream ID: {stream_id}]")
+        except:
+            pass
+
+        return masked_error
+
     def check_stream(self, stream_data, timeout, retries, logger, skip_retries=False, settings=None, retry_attempt=0):
         """Check individual stream status with optional retries."""
         url, channel_name = stream_data.get('stream_url'), stream_data.get('channel_name')
+        stream_id = stream_data.get('stream_id', 'unknown')
         last_error = "Unknown error"
         last_error_type = "Other"
-        
+
         # Get probe timeout early for use in default return
         probe_timeout = settings.get('probe_timeout', 20) if settings else 20
         
@@ -2774,11 +2606,12 @@ class Plugin:
         # Log final result once if stream is dead after all attempts
         logger.info(f"✗ '{channel_name}' DEAD - {last_error_type}")
 
-        default_return['error'] = last_error
+        # Mask URL in error message before returning
+        masked_error = self._mask_url_in_error(last_error, url, stream_id)
+
+        default_return['error'] = masked_error
         default_return['error_type'] = last_error_type
         return default_return
-
-# Export for Dispatcharr plugin system - Single shared instance to maintain state
 
     def _update_dispatcharr_metadata(self, channel_data, stream_id, metadata, logger):
         """Update stream metadata in Dispatcharr (PostgreSQL only to avoid orphaned Redis keys)"""
@@ -2803,8 +2636,8 @@ class Plugin:
                 # Dead stream - completely clear stream_stats by setting to empty dict
                 logger.debug(f"Clearing metadata for dead stream {stream_id}")
                 try:
-                    from apps.proxy.ts_proxy.models import Stream
-                    stream = Stream.objects.filter(id=stream_id).first()
+                    from apps.proxy.ts_proxy.models import Stream as ProxyStream
+                    stream = ProxyStream.objects.filter(id=stream_id).first()
                     if stream:
                         stream.stream_stats = {}  # Clear all stats
                         stream.save(update_fields=['stream_stats'])
@@ -2846,15 +2679,3 @@ class Plugin:
         except Exception as e:
             logger.error(f"Unexpected error updating Dispatcharr metadata for stream {stream_id}: {e}")
             return False
-
-_plugin_instance = Plugin()
-
-# Export the same instance with different names for compatibility
-plugin = _plugin_instance
-plugin_instance = _plugin_instance
-iptv_checker = _plugin_instance
-IPTV_CHECKER = _plugin_instance
-
-# Export class-level attributes (fields is now a property, so access via instance)
-fields = _plugin_instance.fields
-actions = Plugin.actions
