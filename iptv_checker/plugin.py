@@ -67,7 +67,7 @@ class Plugin:
     # Explicitly set the plugin key
     key = "iptv_checker"
     name = "IPTV Checker"
-    version = "0.6.0b"
+    version = "0.6.0c"
     description = "Check stream status and quality for channels in specified Dispatcharr groups."
 
     @staticmethod
@@ -447,7 +447,7 @@ class Plugin:
         try:
             tmp_path = filepath + '.tmp'
             with open(tmp_path, 'w') as f:
-                json.dump(data, f, indent=indent)
+                json.dump(data, f, indent=indent, default=str)
             os.replace(tmp_path, filepath)
         except Exception as e:
             LOGGER.error(f"Failed to save JSON file {filepath}: {e}")
