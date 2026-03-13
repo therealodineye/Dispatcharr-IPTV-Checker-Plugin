@@ -67,7 +67,7 @@ class Plugin:
     # Explicitly set the plugin key
     key = "iptv_checker"
     name = "IPTV Checker"
-    version = "0.6.0a"
+    version = "0.6.0b"
     description = "Check stream status and quality for channels in specified Dispatcharr groups."
 
     @staticmethod
@@ -427,6 +427,35 @@ class Plugin:
                 json.dump(self.check_progress, f)
         except Exception as e:
             LOGGER.error(f"Failed to save progress file: {e}")
+
+    def _load_json_file(self, filepath):
+        """Safely load a JSON file, returning None if corrupted or missing."""
+        try:
+            with open(filepath, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, ValueError) as e:
+            LOGGER.error(f"Corrupted JSON file {filepath}: {e}")
+            return None
+        except Exception as e:
+            LOGGER.error(f"Failed to load JSON file {filepath}: {e}")
+            return None
+
+    def _save_json_file(self, filepath, data, indent=None):
+        """Atomically save data to a JSON file using temp file + rename."""
+        try:
+            tmp_path = filepath + '.tmp'
+            with open(tmp_path, 'w') as f:
+                json.dump(data, f, indent=indent)
+            os.replace(tmp_path, filepath)
+        except Exception as e:
+            LOGGER.error(f"Failed to save JSON file {filepath}: {e}")
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def on_load(self, context):
         """Called when plugin is loaded or reloaded."""
@@ -1124,13 +1153,8 @@ class Plugin:
         if self.check_progress['status'] == 'running':
             return {"status": "info", "message": "A stream check is currently running.\n\nUse '📊 View Check Progress' to see the current status."}
 
-        if not os.path.exists(self.results_file):
-            return {"status": "info", "message": "No results available yet.\n\nUse '▶️ Start Stream Check' to begin checking streams."}
-
-        with open(self.results_file, 'r') as f:
-            results = json.load(f)
-
-        if not results:
+        results = self._load_json_file(self.results_file)
+        if results is None:
             return {"status": "info", "message": "No results available yet.\n\nUse '▶️ Start Stream Check' to begin checking streams."}
 
         # Show results summary
@@ -1294,8 +1318,7 @@ class Plugin:
 
             loaded_channels.append({**channel, "streams": channel_streams})
 
-        with open(self.loaded_channels_file, 'w') as f:
-            json.dump(loaded_channels, f)
+        self._save_json_file(self.loaded_channels_file, loaded_channels)
 
         return self._build_load_success_message(loaded_channels, settings, group_names_str, target_group_names)
     
@@ -1341,11 +1364,9 @@ class Plugin:
                 percent = (current / total * 100) if total > 0 else 0
                 return {"status": "info", "message": f"A stream check is already running ({percent:.0f}% complete).\n\nUse '📊 View Check Progress' to monitor the current check."}
 
-            if not os.path.exists(self.loaded_channels_file):
-                return {"status": "error", "message": "No channels loaded. Please run '📥 Load Group(s)' first."}
-
-            with open(self.loaded_channels_file, 'r') as f:
-                loaded_channels = json.load(f)
+            loaded_channels = self._load_json_file(self.loaded_channels_file)
+            if loaded_channels is None:
+                return {"status": "error", "message": "No channels loaded (or data corrupted). Please run '📥 Load Group(s)' first."}
 
             all_streams = [
                 {"channel_id": ch['id'], "channel_name": ch['name'], "stream_url": s['url'], "stream_id": s['id']}
@@ -1406,14 +1427,10 @@ class Plugin:
         
         # Load channel data for metadata updates
         channel_map = {}
-        try:
-            if os.path.exists(self.loaded_channels_file):
-                with open(self.loaded_channels_file, 'r') as f:
-                    loaded_channels = json.load(f)
-                    for channel in loaded_channels:
-                        channel_map[channel.get('id')] = channel
-        except Exception as e:
-            logger.warning(f"Could not load channel data for metadata updates: {e}")
+        loaded_channels = self._load_json_file(self.loaded_channels_file)
+        if loaded_channels:
+            for channel in loaded_channels:
+                channel_map[channel.get('id')] = channel
 
         try:
             for i, stream_data in enumerate(all_streams):
@@ -1515,8 +1532,7 @@ class Plugin:
                             results[j] = {**retry_stream, **retry_result}
                             break
 
-            with open(self.results_file, 'w') as f:
-                json.dump(results, f, indent=2)
+            self._save_json_file(self.results_file, results, indent=2)
 
         except Exception as e:
             logger.error(f"Background stream processing error: {e}")
@@ -1548,14 +1564,10 @@ class Plugin:
         
         # Load channel data for metadata updates
         channel_map = {}
-        try:
-            if os.path.exists(self.loaded_channels_file):
-                with open(self.loaded_channels_file, 'r') as f:
-                    loaded_channels = json.load(f)
-                    for channel in loaded_channels:
-                        channel_map[channel.get('id')] = channel
-        except Exception as e:
-            logger.warning(f"Could not load channel data for metadata updates: {e}")
+        loaded_channels = self._load_json_file(self.loaded_channels_file)
+        if loaded_channels:
+            for channel in loaded_channels:
+                channel_map[channel.get('id')] = channel
 
         try:
             logger.info(f"Starting parallel stream checking with {workers} workers")
@@ -1667,8 +1679,7 @@ class Plugin:
                         # Find remaining streams with retryable errors for next retry
                         retry_streams = [(i, r) for i, r in enumerate(results) if r.get('error_type') in retryable_errors]
 
-            with open(self.results_file, 'w') as f:
-                json.dump(results, f, indent=2)
+            self._save_json_file(self.results_file, results, indent=2)
 
         except Exception as e:
             logger.error(f"Background parallel stream processing error: {e}")
@@ -1695,10 +1706,9 @@ class Plugin:
         if "{name}" not in rename_format:
             return {"status": "error", "message": "Dead Channel Rename Format must contain {name} placeholder."}
 
-        if not os.path.exists(self.results_file):
-            return {"status": "error", "message": "No check results found. Please run 'Check Streams' first."}
-
-        with open(self.results_file, 'r') as f: results = json.load(f)
+        results = self._load_json_file(self.results_file)
+        if results is None:
+            return {"status": "error", "message": "No check results found (or data corrupted). Please run 'Check Streams' first."}
 
         dead_channels = {r['channel_id']: r['channel_name'] for r in results if r['status'] == 'Dead'}
         if not dead_channels: return {"status": "success", "message": "No dead channels found in the last check."}
@@ -1724,10 +1734,9 @@ class Plugin:
         if not move_to_group_name:
             return {"status": "error", "message": "Please enter a destination group name in the settings."}
 
-        if not os.path.exists(self.results_file):
-            return {"status": "error", "message": "No check results found. Please run 'Check Streams' first."}
-
-        with open(self.results_file, 'r') as f: results = json.load(f)
+        results = self._load_json_file(self.results_file)
+        if results is None:
+            return {"status": "error", "message": "No check results found (or data corrupted). Please run 'Check Streams' first."}
         
         dead_channel_ids = {r['channel_id'] for r in results if r['status'] == 'Dead'}
         if not dead_channel_ids: return {"status": "success", "message": "No dead channels were found in the last check."}
@@ -1753,10 +1762,9 @@ class Plugin:
         if "{name}" not in rename_format:
             return {"status": "error", "message": "Low Framerate Rename Format must contain {name} placeholder."}
 
-        if not os.path.exists(self.results_file):
-            return {"status": "error", "message": "No check results found. Please run 'Check Streams' first."}
-
-        with open(self.results_file, 'r') as f: results = json.load(f)
+        results = self._load_json_file(self.results_file)
+        if results is None:
+            return {"status": "error", "message": "No check results found (or data corrupted). Please run 'Check Streams' first."}
 
         low_fps_channels = {r['channel_id']: r['channel_name'] for r in results if 0 < r.get('framerate_num', 0) < 30}
         if not low_fps_channels: return {"status": "success", "message": "No low framerate channels found."}
@@ -1782,10 +1790,9 @@ class Plugin:
         if not group_name:
             return {"status": "error", "message": "Please enter a destination group name."}
 
-        if not os.path.exists(self.results_file):
-            return {"status": "error", "message": "No check results found. Please run 'Check Streams' first."}
-
-        with open(self.results_file, 'r') as f: results = json.load(f)
+        results = self._load_json_file(self.results_file)
+        if results is None:
+            return {"status": "error", "message": "No check results found (or data corrupted). Please run 'Check Streams' first."}
         
         low_fps_channel_ids = {r['channel_id'] for r in results if 0 < r.get('framerate_num', 0) < 30}
         if not low_fps_channel_ids: return {"status": "success", "message": "No low framerate channels found to move."}
@@ -1809,10 +1816,9 @@ class Plugin:
         suffixes_to_add = {s.strip() for s in suffixes_to_add_str.split(',')}
         logger.info(f"DEBUG: Configured suffixes to add: {suffixes_to_add}")
 
-        if not os.path.exists(self.results_file):
-            return {"status": "error", "message": "No check results found. Please run 'Check Streams' first."}
-
-        with open(self.results_file, 'r') as f: results = json.load(f)
+        results = self._load_json_file(self.results_file)
+        if results is None:
+            return {"status": "error", "message": "No check results found (or data corrupted). Please run 'Check Streams' first."}
         logger.info(f"DEBUG: Loaded {len(results)} results from last check")
 
         channel_formats = {}
@@ -1894,8 +1900,8 @@ class Plugin:
 
     def view_table_action(self, settings, logger):
         """Display results in table format"""
-        if not os.path.exists(self.results_file): return {"status": "error", "message": "No results available."}
-        with open(self.results_file, 'r') as f: results = json.load(f)
+        results = self._load_json_file(self.results_file)
+        if results is None: return {"status": "error", "message": "No results available."}
         lines = ["="*120, f"{'Channel Name':<35} {'Status':<8} {'Format':<8} {'FPS':<8} {'Error Type':<20} {'Error Details':<35}", "="*120]
         for r in results:
             fps = r.get('framerate_num', 0)
@@ -2013,8 +2019,8 @@ class Plugin:
 
     def export_results_action(self, settings, logger):
         """Export results to CSV"""
-        if not os.path.exists(self.results_file): return {"status": "error", "message": "No results to export."}
-        with open(self.results_file, 'r') as f: results = json.load(f)
+        results = self._load_json_file(self.results_file)
+        if results is None: return {"status": "error", "message": "No results to export."}
 
         # Flatten ffprobe_data and round framerate for cleaner CSV
         for result in results:
